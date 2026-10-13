@@ -1,5 +1,7 @@
 import asyncio
+import copy
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -12,10 +14,40 @@ from ..backend.packs.images import (
     clear_all_emojis,
     clear_category_emojis,
     get_emoji_by_category,
+    IMAGE_EXTENSIONS,
 )
+from ..backend.packs.categories import resolve_safe_category_directory
 from ..backend.packs.storage import install_first_official_pack_from_index
 from ..backend.semantic.storage import invalidate_semantic_metadata
+from ..backend import qq_config as meme_qq
+from ..backend.gallery_capacity import (
+    enforce_all_packs as enforce_gallery_capacity,
+    read_capacity_settings as read_gallery_capacity_settings,
+)
 from ..config import COMMUNITY_INDEX_URL
+
+# [patcher:llm-free-random] 两级骰子发图（随机 / 报送 API），全程不调用聊天模型
+# ⭐ 下列常量现为「兜底默认值」；实际参数读插件配置 generation.llm_free_random.*
+#    （面板 / 配置 JSON / 配置 API 均可调，见 _llm_free_settings）
+LLM_FREE_RANDOM_ENABLED = True
+LLM_FREE_RANDOM_ACTIVE = True  # True=群里任意消息都可触发；False=仅被@/私聊/前缀
+LLM_FREE_RANDOM_PROBABILITY = 3  # 骰子1：命中才发图（兜底值）
+LLM_FREE_RANDOM_EXCLUDE_CATEGORIES = {"needs_review"}
+
+# 骰子2：命中骰子1后，是否报送 API 让模型选分类；未命中则纯随机、不调 API
+LLM_FREE_API_ENABLED = True
+LLM_FREE_API_PROBABILITY = 100  # 骰子2：命中才报送 API（兜底值）
+LLM_FREE_API_PROVIDER_ID = "zhipu/glm-4v-flash"
+LLM_FREE_API_TIMEOUT = 15
+LLM_FREE_API_DAILY_LIMIT = 0
+LLM_FREE_API_COOLDOWN = 60
+
+# [patcher:qq-config] QQ 指令可调参数 + 「表情包」随机发图（2026-10-12 用户拍板）
+PLUGIN_NAME = "meme_manager"
+RANDOM_MEME_COOLDOWN_SECONDS = 3.0  # 同一用户两次「表情包」的最小间隔（Q13=b）
+RANDOM_MEME_EXCLUDE_CATEGORIES = {"needs_review"}  # Q12=c：全包随机但跳过待审分类
+_HOT_RELOAD_DELAY_SECONDS = 1.5  # 先回复、再延迟后台热重载（Q8=a）
+_RANDOM_MEME_LAST_HIT: dict = {}  # {umo|sender_id: 上次命中时刻}
 
 
 class CommandMixin:
@@ -35,6 +67,11 @@ class CommandMixin:
         同步到云端
         从云端同步
         图库统计
+        参数
+        设置
+        清理超额
+
+        （另有独立指令「表情包」：全图库随机发一张）
         """
         pass
 
@@ -184,13 +221,13 @@ class CommandMixin:
     async def upload_meme(self, event: AstrMessageEvent, category: str = None):
         if not category:
             yield event.plain_result(
-                "📌 若要添加表情，请按照此格式操作：\n/表情管理 添加表情 [类别名称]\n（输入/查看图库 可获取类别列表）"
+                "📌 若要添加表情，请按照此格式操作：\n/表情管理 添加表情 [类别名称]\n（输入/表情管理 查看图库 可获取类别列表）"
             )
             return
         descriptions = await asyncio.to_thread(self.category_manager.get_descriptions)
         if category not in descriptions:
             yield event.plain_result(
-                f"您输入的表情包类别「{category}」是无效的哦。\n可以使用/查看表情包来查看可用的类别。"
+                f"您输入的表情包类别「{category}」是无效的哦。\n可以使用/表情管理 查看图库来查看可用的类别。"
             )
             return
         user_key = f"{event.session_id}_{event.get_sender_id()}"
@@ -856,3 +893,671 @@ class CommandMixin:
         except Exception as e:
             logger.error(f"获取图库统计失败: {str(e)}")
             yield event.plain_result(f"获取图库统计失败: {str(e)}")
+
+    # ---------- [patcher:llm-free-random] 两级骰子发图 ----------
+    def _llm_free_settings(self) -> dict:
+        """读取插件配置 generation.llm_free_random.*，缺键/非法值时回退模块常量。
+
+        把「概率」从硬编码提升为面板可调项（2026-10-11）。面板保存会触发
+        plugin_manager.reload() → 本方法下次被调用即读到新值。
+        """
+        cfg = getattr(self, "config", None)
+        node = None
+        if isinstance(cfg, dict):
+            gen = cfg.get("generation")
+            if isinstance(gen, dict):
+                candid = gen.get("llm_free_random")
+                if isinstance(candid, dict):
+                    node = candid
+
+        def _get(key, fallback):
+            if node is not None and key in node and node.get(key) is not None:
+                return node.get(key)
+            return fallback
+
+        def _to_bool(value, fallback):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(fallback)
+
+        def _to_float(value, fallback):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float(fallback)
+
+        def _to_int(value, fallback):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return int(fallback)
+
+        raw_exclude = _get("exclude_categories", None)
+        if isinstance(raw_exclude, (list, tuple, set)):
+            exclude = {str(x).strip() for x in raw_exclude if str(x).strip()}
+        elif isinstance(raw_exclude, str) and raw_exclude.strip():
+            parts = [t.strip() for t in re.split(r"[,\s]+", raw_exclude)]
+            exclude = {p for p in parts if p}
+        else:
+            exclude = set(LLM_FREE_RANDOM_EXCLUDE_CATEGORIES)
+
+        return {
+            "enabled": _to_bool(_get("enabled", None), LLM_FREE_RANDOM_ENABLED),
+            "active": _to_bool(_get("active", None), LLM_FREE_RANDOM_ACTIVE),
+            "probability": _to_float(
+                _get("probability", None), LLM_FREE_RANDOM_PROBABILITY
+            ),
+            "exclude_categories": exclude,
+            "api_enabled": _to_bool(_get("api_enabled", None), LLM_FREE_API_ENABLED),
+            "api_probability": _to_float(
+                _get("api_probability", None), LLM_FREE_API_PROBABILITY
+            ),
+            "api_provider_id": str(
+                _get("api_provider_id", None) or LLM_FREE_API_PROVIDER_ID
+            ),
+            "api_timeout": _to_float(_get("api_timeout", None), LLM_FREE_API_TIMEOUT),
+            "api_daily_limit": _to_int(
+                _get("api_daily_limit", None), LLM_FREE_API_DAILY_LIMIT
+            ),
+            "api_cooldown": _to_float(
+                _get("api_cooldown", None), LLM_FREE_API_COOLDOWN
+            ),
+        }
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-100)
+    async def _llm_free_random_meme(self, event: AstrMessageEvent):
+        """不调用聊天模型，按两级概率决定是否发图、以及是否用模型选分类。
+
+        ⚠️ 副作用修复（[patcher:qq-config]，2026-10-12）：本 handler 的 priority=-100
+        最低，运行在「表情包」等显式指令之后。若不拦截，@bot 发「表情包」时本 handler
+        仍有 `probability`% 概率再补一张 → **双发**。故显式指令会置 extra
+        `meme_manager_skip_random=True`，此处直接早返回。其他插件已经回复时也不再附赠图片。
+        """
+        if getattr(event, "_has_send_oper", False):
+            return
+        try:
+            if event.get_extra("meme_manager_skip_random"):
+                return
+        except Exception:
+            pass
+        settings = self._llm_free_settings()
+        if not settings["enabled"]:
+            return
+        if settings["active"]:
+            # 主动模式：群里任何消息都可触发（不要求 @ 或唤醒前缀）
+            if not getattr(event, "is_wake", False):
+                return
+        elif not getattr(event, "is_at_or_wake_command", False):
+            return
+
+        # 显式命令（以唤醒前缀开头）不附赠表情
+        try:
+            text = (event.get_message_str() or "").strip()
+        except Exception:
+            text = ""
+        for prefix in self._llm_free_wake_prefixes():
+            if prefix and text.startswith(prefix):
+                return
+
+        # 骰子 1：这一轮到底发不发图（未命中即零开销返回）
+        if not self._llm_free_probability_hit(settings["probability"]):
+            return
+
+        try:
+            memes_root = self._get_runtime_memes_dir_for_event(event)
+        except Exception as e:
+            logger.error(f"[meme_manager] 免聊天模型发图：解析图库目录失败: {e}")
+            return
+
+        # 骰子 2：随机抽 还是 报送 API
+        category = ""
+        route = "random"
+        if settings["api_enabled"] and self._llm_free_probability_hit(
+            settings["api_probability"]
+        ):
+            if self._llm_free_api_allowed(event, settings):
+                route = "api"
+                category = await self._llm_free_pick_category_by_api(
+                    event, text, settings
+                )
+                if not category:
+                    route = "api_fallback"
+
+        picked = await self._llm_free_pick_image(memes_root, category, settings)
+        if not picked:
+            return
+
+        logger.info(
+            "[meme_manager] 免聊天模型发图：route=%s category=%s file=%s",
+            route,
+            category or "-",
+            picked,
+        )
+
+        final_path = picked
+        try:
+            final_path = await asyncio.to_thread(self._convert_to_gif, picked)
+            await self._send_meme_image(event, Image.fromFileSystem(final_path))
+        except Exception as e:
+            logger.error(f"[meme_manager] 免聊天模型发图：发送失败: {e}")
+        finally:
+            if final_path != picked and os.path.exists(final_path):
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+
+    def _llm_free_probability_hit(self, probability) -> bool:
+        """掷一次骰子，probability 为命中百分比（0~100，**支持小数**如 0.5）。
+
+        ⚠️ 必须用浮点：旧版 `int(probability)` 会把 0.5 截成 0 再被夹到 1，
+        导致小数概率失效（2026-10-11 修）。
+        """
+        try:
+            value = float(probability)
+        except Exception:
+            value = 100.0
+        if value >= 100.0:
+            return True
+        if value <= 0.0:
+            return False
+        return (random.random() * 100.0) < value
+
+    def _llm_free_api_allowed(self, event: AstrMessageEvent, settings: dict) -> bool:
+        """日配额 + 每会话冷却，防止被刷消息推高 API 成本。"""
+        state = getattr(self, "_llm_free_api_state", None)
+        if not isinstance(state, dict):
+            state = {"day": "", "used": 0, "last": {}}
+            self._llm_free_api_state = state
+
+        today = time.strftime("%Y%m%d")
+        if state.get("day") != today:
+            state["day"] = today
+            state["used"] = 0
+            state["last"] = {}
+
+        try:
+            limit = int(settings.get("api_daily_limit") or 0)
+        except Exception:
+            limit = 0
+        if limit > 0 and int(state.get("used") or 0) >= limit:
+            return False
+
+        try:
+            cooldown = float(settings.get("api_cooldown") or 0.0)
+        except Exception:
+            cooldown = 0.0
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        last = state.get("last") or {}
+        if cooldown > 0 and (time.time() - float(last.get(umo) or 0)) < cooldown:
+            return False
+
+        last[umo] = time.time()
+        state["last"] = last
+        state["used"] = int(state.get("used") or 0) + 1
+        return True
+
+    async def _llm_free_pick_category_by_api(
+        self, event: AstrMessageEvent, text: str, settings: dict
+    ) -> str:
+        """报送 API：让模型读用户消息，从可用分类里挑一个键。
+
+        只接受与现存分类键**完全一致**的 token，杜绝模型幻觉。
+        返回空字符串表示「交给调用方回落随机」。
+        """
+        mapping = getattr(self, "category_mapping", None) or {}
+        if not isinstance(mapping, dict) or not mapping:
+            return ""
+        exclude = settings.get("exclude_categories") or set()
+        allowed = {
+            str(k).strip(): str(v)
+            for k, v in mapping.items()
+            if str(k).strip() and str(k).strip() not in exclude
+        }
+        if not allowed or not text:
+            return ""
+
+        options = "\n".join(f"{key} - {desc}" for key, desc in allowed.items())
+        prompt = (
+            "任务：为下面这条聊天消息挑一个最贴切的表情分类，仅用于发送一张表情图片。\n"
+            "只输出一个分类键；没有任何分类贴切时输出 none。\n"
+            "不要输出解释、标点、代码框或任何多余内容。\n\n"
+            f"可选分类：\n{options}\n\n"
+            f"聊天消息：{text[:500]}"
+        )
+
+        kwargs: dict = {"prompt": prompt}
+        provider_id = str(settings.get("api_provider_id") or "").strip()
+        if provider_id:
+            kwargs["chat_provider_id"] = provider_id
+
+        try:
+            response = await asyncio.wait_for(
+                self.context.llm_generate(**kwargs),
+                timeout=float(settings.get("api_timeout") or 0) or None,
+            )
+        except Exception as e:
+            logger.warning(f"[meme_manager] 免聊天模型发图：API 选分类失败: {e}")
+            return ""
+
+        raw = str(getattr(response, "completion_text", "") or "").strip()
+        if not raw:
+            return ""
+        for token in re.split(r"[^A-Za-z0-9_\-]+", raw):
+            token = token.strip()
+            if token and token in allowed:
+                return token
+        return ""
+
+    async def _llm_free_pick_image(
+        self, memes_root, category: str = "", settings: dict = None
+    ) -> str:
+        """按分类抽一张；无分类或该分类为空时回落全池随机。"""
+        root = Path(memes_root)
+        if not root.is_dir():
+            return ""
+
+        exclude = set(LLM_FREE_RANDOM_EXCLUDE_CATEGORIES)
+        if isinstance(settings, dict):
+            exclude = settings.get("exclude_categories") or exclude
+
+        if category:
+            try:
+                category_dir = resolve_safe_category_directory(memes_root, category)
+            except Exception:
+                category_dir = None
+            if category_dir and category_dir.is_dir():
+                names = [
+                    f
+                    for f in os.listdir(category_dir)
+                    if f.lower().endswith(IMAGE_EXTENSIONS)
+                ]
+                if names:
+                    return str(category_dir / random.choice(names))
+
+        candidates: list[str] = []
+        try:
+            for category_dir in sorted(root.iterdir()):
+                if not category_dir.is_dir():
+                    continue
+                if category_dir.name in exclude:
+                    continue
+                for name in os.listdir(category_dir):
+                    if name.lower().endswith(IMAGE_EXTENSIONS):
+                        candidates.append(str(category_dir / name))
+        except Exception as e:
+            logger.error(f"[meme_manager] 免聊天模型发图：扫描图库失败: {e}")
+            return ""
+
+        return random.choice(candidates) if candidates else ""
+
+    def _llm_free_wake_prefixes(self) -> tuple:
+        """当前配置的唤醒前缀，用于排除显式命令。"""
+        try:
+            cfg = self.context.get_config()
+            prefixes = (cfg.get("wake_prefix") or []) if hasattr(cfg, "get") else []
+        except Exception:
+            prefixes = []
+        return tuple(str(p).strip() for p in prefixes if str(p).strip())
+
+    # ========== [patcher:qq-config] 「表情包」随机发图 ==========
+    @filter.command("表情包")
+    async def random_meme_command(self, event: AstrMessageEvent):
+        """全图库随机发一张表情包。
+
+        Q12=c：覆盖全部表情包，但跳过 `needs_review` 待审分类；
+        Q13=b：1 张、纯图无文字、同一用户 3 秒防抖；
+        Q14=a：任何人可用（管理类指令另有 ADMIN 限制兜底）。
+        """
+        # 副作用修复：抑制 llm_free_random 对本轮再补一张（否则会双发）
+        try:
+            event.set_extra("meme_manager_skip_random", True)
+        except Exception:
+            pass
+
+        cooldown_key = f"{event.unified_msg_origin}|{event.get_sender_id()}"
+        now = time.time()
+        last = _RANDOM_MEME_LAST_HIT.get(cooldown_key, 0.0)
+        if now - last < RANDOM_MEME_COOLDOWN_SECONDS:
+            remain = max(1, int(RANDOM_MEME_COOLDOWN_SECONDS - (now - last) + 0.999))
+            yield event.plain_result(f"⌛ 慢一点，{remain} 秒后再试～")
+            return
+        _RANDOM_MEME_LAST_HIT[cooldown_key] = now
+
+        try:
+            picked = await asyncio.to_thread(self._random_meme_across_packs)
+        except Exception as exc:
+            logger.error("[meme_manager] 「表情包」随机取图失败：%s", exc)
+            picked = ""
+        if not picked:
+            yield event.plain_result("📭 图库里还没有可发送的表情包。")
+            return
+
+        final_path = picked
+        try:
+            final_path = await asyncio.to_thread(self._convert_to_gif, picked)
+        except Exception:
+            final_path = picked
+        if final_path != picked:
+            # 临时 GIF 交给 after_message_sent 统一清理（本插件既有机制）
+            existing = event.get_extra("meme_manager_temp_files") or []
+            event.set_extra("meme_manager_temp_files", list(existing) + [final_path])
+        logger.info("[meme_manager] 「表情包」指令命中：file=%s", picked)
+        yield event.image_result(final_path)
+
+    def _random_meme_across_packs(self) -> str:
+        """在全部表情包里随机抽一张（跳过 needs_review 待审分类）。"""
+        from ..backend.gallery_capacity import list_pack_ids, pack_memes_dir
+
+        candidates: list = []
+        for pack_id in list_pack_ids():
+            memes_dir = pack_memes_dir(pack_id)
+            if not memes_dir.is_dir():
+                continue
+            try:
+                category_dirs = sorted(memes_dir.iterdir(), key=lambda p: p.name)
+            except OSError:
+                continue
+            for category_dir in category_dirs:
+                if not category_dir.is_dir() or category_dir.is_symlink():
+                    continue
+                if category_dir.name in RANDOM_MEME_EXCLUDE_CATEGORIES:
+                    continue
+                try:
+                    names = os.listdir(category_dir)
+                except OSError:
+                    continue
+                for name in names:
+                    if name.lower().endswith(IMAGE_EXTENSIONS):
+                        candidates.append(str(category_dir / name))
+        if not candidates:
+            return ""
+        return random.choice(candidates)
+
+    # ========== [patcher:qq-config] 参数查看 / 修改 ==========
+    def _params_listing(self) -> str:
+        """把可调 + 只读参数渲染成手机友好的清单。"""
+        lines = ["🔧 表情包可调参数", "改法：/表情管理 设置 <参数名> <值>", ""]
+        current_group = None
+        for spec in meme_qq.PARAMS:
+            if spec["group"] != current_group:
+                current_group = spec["group"]
+                lines.append(f"【{current_group}】")
+            value = meme_qq.get_by_path(self.config, spec["path"])
+            if value is None:
+                value = spec["default"]
+            lines.append(f"  {spec['alias']} = {meme_qq.format_value(spec, value)}")
+        lines.append("")
+        lines.append("【只读（指令不可改，请用插件面板）】")
+        for spec in meme_qq.READONLY:
+            value = meme_qq.get_by_path(self.config, spec["path"])
+            lines.append(
+                f"  {spec['alias']} = {meme_qq.format_value(spec, value)}"
+                f"（{spec['desc']}）"
+            )
+        lines.append("")
+        lines.append("提示：值填「默认」可还原；参数名也接受完整配置路径。")
+        return "\n".join(lines)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("参数")
+    async def show_config_params(self, event: AstrMessageEvent, key: str = ""):
+        """查看可调参数：不填键名列出全部，填键名看单项。"""
+        token = str(key or "").strip()
+        if not token:
+            yield event.plain_result(self._params_listing())
+            return
+        spec = meme_qq.resolve(token)
+        if spec is None:
+            readonly = meme_qq.is_readonly(token)
+            if readonly is not None:
+                value = meme_qq.get_by_path(self.config, readonly["path"])
+                yield event.plain_result(
+                    f"ℹ️「{readonly['alias']}」= "
+                    f"{meme_qq.format_value(readonly, value)}（只读项，指令不可改）\n"
+                    f"说明：{readonly['desc']}\n路径：{readonly['path']}"
+                )
+                return
+            yield event.plain_result(
+                f"⚠️ 未收录参数「{token}」。\n用 /表情管理 参数 查看全部可调项。"
+            )
+            return
+        value = meme_qq.get_by_path(self.config, spec["path"])
+        if value is None:
+            value = spec["default"]
+        yield event.plain_result(
+            f"🔧 {spec['alias']} = {meme_qq.format_value(spec, value)}\n"
+            f"说明：{spec['desc']}\n"
+            f"路径：{spec['path']}\n"
+            f"改法：/表情管理 设置 {spec['alias']} <值>"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("设置")
+    async def set_config_param(
+        self, event: AstrMessageEvent, key: str = "", value: str = ""
+    ):
+        """修改可调参数：/表情管理 设置 <参数名> <值|默认>。"""
+        token = str(key or "").strip()
+        if not token:
+            yield event.plain_result(
+                "📌 用法：/表情管理 设置 <参数名> <值>\n"
+                "用 /表情管理 参数 查看全部可调项。"
+            )
+            return
+        spec = meme_qq.resolve(token)
+        if spec is None:
+            readonly = meme_qq.is_readonly(token)
+            if readonly is not None:
+                yield event.plain_result(
+                    f"🚫 「{readonly['alias']}」是只读项（{readonly['desc']}），"
+                    "不能在指令里修改，请到插件面板调整。"
+                )
+                return
+            yield event.plain_result(
+                f"⚠️ 未收录参数「{token}」。\n用 /表情管理 参数 查看全部可调项。"
+            )
+            return
+
+        if not str(value or "").strip():
+            current = meme_qq.get_by_path(self.config, spec["path"])
+            if current is None:
+                current = spec["default"]
+            yield event.plain_result(
+                f"📌 用法：/表情管理 设置 {spec['alias']} <值>\n"
+                f"当前：{meme_qq.format_value(spec, current)}（{spec['desc']}）\n"
+                f"值填「默认」可还原为 "
+                f"{meme_qq.format_value(spec, spec['default'])}。"
+            )
+            return
+
+        ok, parsed = meme_qq.parse_value(spec, value)
+        if not ok:
+            yield event.plain_result(f"❌ 「{spec['alias']}」设置失败：{parsed}")
+            return
+
+        previous = meme_qq.get_by_path(self.config, spec["path"])
+        if previous is None:
+            previous = spec["default"]
+        try:
+            self._write_config_path(spec["path"], parsed)
+        except Exception as exc:
+            logger.error("[meme_manager] 指令写配置失败：%s", exc, exc_info=True)
+            yield event.plain_result(f"❌ 写入插件配置失败：{exc}")
+            return
+
+        if self._can_hot_reload():
+            scheduled = self._schedule_plugin_reload()
+            tail = (
+                "已保存，1~2 秒后自动重载生效。"
+                if scheduled
+                else "已保存，但未能安排自动重载，请到面板点一次保存或重载插件。"
+            )
+        else:
+            tail = (
+                "已保存。当前有语义 / 图床 / 安装任务在跑，为安全起见未自动重载；"
+                "任务结束后到面板点一次保存即可生效。"
+            )
+        logger.info(
+            "[meme_manager] 指令改配置：%s %s -> %s",
+            spec["path"],
+            previous,
+            parsed,
+        )
+        yield event.plain_result(
+            f"✅ {spec['alias']}：{meme_qq.format_value(spec, previous)}"
+            f" → {meme_qq.format_value(spec, parsed)}\n{tail}"
+        )
+
+    def _write_config_path(self, path: str, value) -> None:
+        """按点路径写入 AstrBotConfig 并原子落盘（BOM+CRLF 由 save_config 保证）。"""
+        if not hasattr(self.config, "save_config"):
+            raise RuntimeError("当前未注册可编辑的 AstrBot 配置")
+        keys = str(path).split(".")
+        snapshot = copy.deepcopy(dict(self.config))
+        updated = copy.deepcopy(snapshot)
+        node = updated
+        for key in keys[:-1]:
+            child = node.get(key)
+            if not isinstance(child, dict):
+                child = {}
+                node[key] = child
+            node = child
+        node[keys[-1]] = value
+        try:
+            self.config.clear()
+            self.config.save_config(updated)
+        except Exception:
+            self.config.clear()
+            self.config.update(snapshot)
+            raise
+        # 同步内存配置，未重载的窗口内也能读到新值
+        try:
+            self.config.clear()
+            self.config.update(updated)
+        except Exception:
+            pass
+
+    def _can_hot_reload(self) -> bool:
+        """热重载安全前置检查：语义任务 / 图床同步 / 社区安装都不在跑。"""
+        try:
+            if any(
+                not task.done()
+                for task in getattr(self, "_community_install_tasks", set())
+            ):
+                return False
+            manager = getattr(self, "semantic_task_manager", None)
+            if manager is not None:
+                if manager.active_pack_tasks():
+                    return False
+                if getattr(manager, "_external_pack_operations", None):
+                    return False
+            sync = getattr(self, "img_sync", None)
+            process = getattr(sync, "sync_process", None)
+            if process is not None and process.is_alive():
+                return False
+        except Exception as exc:
+            logger.warning(
+                "[meme_manager] 热重载前置检查异常，按不安全处理：%s", exc
+            )
+            return False
+        return True
+
+    def _schedule_plugin_reload(self) -> bool:
+        """先回复、再延迟 1.5 秒后台热重载（Q8=a）。
+
+        绝不在指令 handler 自身执行过程中重载插件 —— 那会在事件处理途中替换
+        handler 注册表。调用方应先 yield 结果（pipeline 洋葱模型会在 yield 时
+        立刻发送），本任务随后才真正重载。
+        """
+        manager = getattr(getattr(self, "context", None), "_star_manager", None)
+        if manager is None:
+            logger.warning("[meme_manager] 找不到 star_manager，无法自动重载。")
+            return False
+
+        async def _reload_later():
+            await asyncio.sleep(_HOT_RELOAD_DELAY_SECONDS)
+            try:
+                success, message = await manager.reload(PLUGIN_NAME)
+                if not success:
+                    logger.warning(
+                        "[meme_manager] 参数已写入，但插件重载失败：%s", message
+                    )
+            except Exception as exc:
+                logger.error("[meme_manager] 参数已写入，但插件重载异常：%s", exc)
+
+        try:
+            asyncio.get_running_loop().create_task(_reload_later())
+        except RuntimeError:
+            return False
+        return True
+
+    # ========== [patcher:gallery-capacity] 图库容量手动清理 ==========
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("清理超额")
+    async def prune_over_capacity(self, event: AstrMessageEvent, mode: str = ""):
+        """检查各包张数，超出 `gallery_capacity.max_images` 的按最旧优先清理。
+
+        加 `--dry` 只出清单不删除（Q4=c 的干跑）。
+        """
+        dry = str(mode or "").strip().lower() in {"--dry", "dry", "-d", "干跑"}
+        settings = read_gallery_capacity_settings()
+        if not settings["enabled"] and not dry:
+            yield event.plain_result(
+                "ℹ️ 容量自动清理已关闭（gallery_capacity.enabled = 关），未做任何修改。\n"
+                "如要临时跑一次：/表情管理 设置 容量清理开关 开；\n"
+                "或加 --dry 只看清单。"
+            )
+            return
+        if settings["max_images"] <= 0:
+            yield event.plain_result(
+                "ℹ️ 每包上限 = 0（不限），无需清理。\n"
+                "如需设置：/表情管理 设置 每包上限 10000"
+            )
+            return
+        yield event.plain_result("🔍 正在统计各表情包张数…")
+        try:
+            summary = await asyncio.to_thread(
+                enforce_gallery_capacity,
+                dry_run=dry,
+                force=True,
+                reason="manual-dry" if dry else "manual",
+            )
+        except Exception as exc:
+            logger.error("[meme_manager] 容量清理失败：%s", exc, exc_info=True)
+            yield event.plain_result(f"❌ 容量清理失败：{exc}")
+            return
+
+        lines = [
+            f"🧹 图库容量{'（干跑，未删除）' if dry else ''}｜每包上限 {settings['max_images']} 张"
+        ]
+        touched = 0
+        total = 0
+        for pack_id, result in summary.items():
+            if result.get("skipped") in ("under_limit", "unlimited", "disabled"):
+                continue
+            deleted = result.get("deleted") or []
+            total += len(deleted)
+            touched += 1
+            lines.append(
+                f"• {pack_id}：{result.get('count_before')} 张 → "
+                f"{'将' if dry else '已'}清理 {len(deleted)} 张"
+            )
+            if dry and deleted:
+                for item in deleted[:5]:
+                    lines.append(
+                        f"    - {item.get('category')}/{item.get('file')}"
+                    )
+                if len(deleted) > 5:
+                    lines.append(f"    - …另有 {len(deleted) - 5} 张")
+        if not touched:
+            lines.append("✅ 所有表情包都在上限内，无需清理。")
+        elif dry:
+            lines.append(f"合计将删除 {total} 张（去掉 --dry 即执行）。")
+        else:
+            lines.append(f"合计删除 {total} 张，明细见 logs/capacity_prune.jsonl。")
+        yield event.plain_result("\n".join(lines))

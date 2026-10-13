@@ -1,6 +1,25 @@
+"""SQLite-backed fingerprint index for the auto-collect pipeline.
+
+[patcher:sqlite-index]
+
+为什么改：`lookup()` 原本每次都重走整棵 pack 目录树，对每个文件做
+`Path.resolve()` + `stat()`（几千文件十几秒），而它面对的只是"一张新图"。
+
+现在把「路径 -> (大小, mtime_ns, sha256, dHash)」落在 pack 同级的 SQLite 文件里，
+枚举改用 `os.scandir()`——Windows 上目录项自带 stat，不再需要逐文件
+`resolve()`/`stat()`——并且**只对"大小/mtime 变了或新出现"的文件重算 sha256**。
+原地改写（目录 mtime 不变）也能被逐文件比对捕捉到，语义与原实现一致。
+
+空间代价约 0.7 KB/张（几千张约 2~3 MB）；内存是"不驻留"的：
+没有常驻的目录/指纹字典，只有一个 2 MB 的 SQLite 页缓存，逐目录流式比对，
+单次 lookup 的临时峰值约几百 KB，函数返回即释放。
+"""
+
 from __future__ import annotations
 
 import hashlib
+import os
+import sqlite3
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +28,15 @@ from threading import RLock
 from PIL import Image
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+_SCHEMA = "sqlite-index/3"
+_DHASH_UNSET = -1
+_DDL = (
+    "CREATE TABLE IF NOT EXISTS files("
+    "  p TEXT PRIMARY KEY, d TEXT, s INTEGER, m INTEGER, h TEXT, v INTEGER);"
+    "CREATE INDEX IF NOT EXISTS idx_files_h ON files(h);"
+    "CREATE INDEX IF NOT EXISTS idx_files_d ON files(d);"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,19 +54,47 @@ class ImageMatch:
     distance: int | None = None
 
 
+def _index_dir(pack_root: Path) -> Path:
+    """Return the directory that holds index databases for one pack tree."""
+    packs_dir = pack_root.parent.parent
+    if packs_dir.name == "packs":
+        # <plugin_data>/packs/<pack_id>/memes -> <plugin_data>/auto_collect_index
+        return packs_dir.parent / "auto_collect_index"
+    return pack_root / ".auto_collect_index"
+
+
+def _db_file(pack_root: Path) -> Path:
+    """Return the SQLite path for one pack tree."""
+    name = pack_root.parent.name or "pack"
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in name)
+    return _index_dir(pack_root) / ((safe or "pack") + ".sqlite3")
+
+
+def _to_signed(value: int | None) -> int | None:
+    """Store a 64-bit dHash in a signed column without losing bits."""
+    if value is None or value == _DHASH_UNSET:
+        return _DHASH_UNSET
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def _to_unsigned(value: int | None) -> int | None:
+    """Restore a signed column value to a 64-bit unsigned dHash."""
+    if value is None or value == _DHASH_UNSET:
+        return None
+    return value & ((1 << 64) - 1)
+
+
 class AutoCollectImageIndex:
-    """Cache file fingerprints per pack, with bounded least-recently-used packs."""
+    """Persist pack fingerprints on disk and rehash only new or changed files."""
 
     def __init__(self, max_packs: int = 8):
         """Initialize an index safe for concurrent background lookups.
 
         Args:
-            max_packs: Maximum number of pack manifests retained in memory.
+            max_packs: Maximum number of open pack databases retained.
         """
         self.max_packs = max(1, max_packs)
-        self._packs: OrderedDict[Path, dict[Path, tuple[int, int, str, int | None]]] = (
-            OrderedDict()
-        )
+        self._packs: OrderedDict[Path, sqlite3.Connection] = OrderedDict()
         self._lock = RLock()
 
     @staticmethod
@@ -71,6 +127,151 @@ class AutoCollectImageIndex:
         except (OSError, ValueError, Image.DecompressionBombError):
             return None
 
+    # ------------------------------------------------------------------ 存储
+    def _connect(self, pack_root: Path) -> sqlite3.Connection:
+        """Open (or reuse) the SQLite database for one pack tree."""
+        db_file = _db_file(pack_root)
+        cached = self._packs.pop(db_file, None)
+        if cached is not None:
+            self._packs[db_file] = cached
+            return cached
+
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(db_file, timeout=30, check_same_thread=False)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA cache_size=-2048")  # 页缓存上限约 2 MB
+        connection.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        row = connection.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
+        if row is None or row[0] != _SCHEMA:
+            # 结构变更时整体重建，避免残留旧列。
+            connection.executescript("DROP TABLE IF EXISTS dirs; DROP TABLE IF EXISTS files;")
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(k, v) VALUES('schema', ?)", (_SCHEMA,)
+            )
+        connection.executescript(_DDL)
+        connection.commit()
+
+        self._packs[db_file] = connection
+        while len(self._packs) > self.max_packs:
+            _, stale = self._packs.popitem(last=False)
+            try:
+                stale.close()
+            except sqlite3.Error:
+                pass
+        return connection
+
+    # ------------------------------------------------------------------ 扫描
+    @staticmethod
+    def _digest_of(path: Path) -> str | None:
+        """Hash one file's bytes, returning None when it cannot be read."""
+        try:
+            hasher = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except OSError:
+            return None
+
+    def _sync_directory(
+        self, connection: sqlite3.Connection, root: Path, resolved: Path
+    ) -> list[Path]:
+        """Reconcile one directory and return its in-root sub-directories.
+
+        Only files whose size or mtime moved are hashed again; rows for files
+        that vanished are deleted. Nothing is retained after the call.
+        """
+        key = str(resolved)
+        try:
+            scan = os.scandir(resolved)
+        except OSError:
+            return []
+
+        known = {
+            row[0]: (row[1], row[2])
+            for row in connection.execute("SELECT p, s, m FROM files WHERE d=?", (key,))
+        }
+        subdirs: list[Path] = []
+        seen = set()
+        dirty = False
+
+        with scan as scanner:
+            for entry in scanner:
+                try:
+                    # 排除符号链接，包括 Windows 目录联接。
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        child = Path(entry.path)
+                        try:
+                            if child.resolve().is_relative_to(root):
+                                subdirs.append(child)
+                        except (OSError, RuntimeError):
+                            pass
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if Path(entry.name).suffix.lower() not in IMAGE_EXTENSIONS:
+                        continue
+                    # Windows 上 DirEntry.stat() 直接来自目录枚举，不额外发系统调用。
+                    stat = entry.stat()
+                    signature = (stat.st_size, stat.st_mtime_ns)
+                    path_text = entry.path
+                    seen.add(path_text)
+                    if known.get(path_text) == signature:
+                        continue
+                    digest = self._digest_of(resolved / entry.name)
+                    if digest is None:
+                        continue
+                    connection.execute(
+                        "INSERT OR REPLACE INTO files(p, d, s, m, h, v)"
+                        " VALUES(?,?,?,?,?,NULL)",
+                        (path_text, key, signature[0], signature[1], digest),
+                    )
+                    dirty = True
+                except OSError:
+                    continue
+
+        stale = [(path_text,) for path_text in known.keys() - seen]
+        if stale:
+            connection.executemany("DELETE FROM files WHERE p=?", stale)
+            dirty = True
+        if dirty:
+            connection.commit()
+        return subdirs
+
+    def _refresh(self, connection: sqlite3.Connection, root: Path) -> None:
+        """Walk the tree with scandir and rehash only new or changed files."""
+        pending = [root]
+        visited = set()
+        while pending:
+            directory = pending.pop()
+            try:
+                resolved = directory.resolve()
+                if not resolved.is_relative_to(root):
+                    continue
+                key = str(resolved)
+                if key in visited:
+                    continue
+                visited.add(key)
+            except (OSError, RuntimeError):
+                continue
+            pending.extend(self._sync_directory(connection, root, resolved))
+
+    def _fill_visual_hashes(self, connection: sqlite3.Connection) -> None:
+        """Compute dHash for rows that still carry no visual fingerprint."""
+        rows = connection.execute("SELECT p FROM files WHERE v IS NULL").fetchall()
+        if not rows:
+            return
+        for (path_text,) in rows:
+            visual = self._difference_hash(Path(path_text))
+            connection.execute(
+                "UPDATE files SET v=? WHERE p=?", (_to_signed(visual), path_text)
+            )
+        connection.commit()
+
+    # ------------------------------------------------------------------ 查询
     def lookup(
         self, pack_root: Path, digest: str, candidate_path: Path | None = None
     ) -> ImageMatch:
@@ -89,79 +290,40 @@ class AutoCollectImageIndex:
         Returns:
             Exact match or closest static-image hint within five differing bits.
         """
-        root = Path(pack_root).resolve()
+        try:
+            root = Path(pack_root).resolve()
+        except OSError:
+            return ImageMatch()
+        if not root.is_dir():
+            return ImageMatch()
+
         with self._lock:
-            previous = self._packs.pop(root, {})
-            current = {}
-            # 遍历前排除符号链接，包括 Windows 目录联接。
-            directories = [root]
-            visited = set()
-            while directories:
-                directory = directories.pop()
-                try:
-                    resolved = directory.resolve()
-                    if not resolved.is_relative_to(root) or resolved in visited:
-                        continue
-                    visited.add(resolved)
-                    children = list(directory.iterdir())
-                except (OSError, RuntimeError):
-                    continue
-                for path in children:
-                    try:
-                        if path.is_symlink() or not path.resolve().is_relative_to(root):
-                            continue
-                        if path.is_dir():
-                            directories.append(path)
-                            continue
-                        if (
-                            path.suffix.lower() not in IMAGE_EXTENSIONS
-                            or not path.is_file()
-                        ):
-                            continue
-                        stat = path.stat()
-                        signature = (stat.st_size, stat.st_mtime_ns)
-                        cached = previous.get(path)
-                        if cached is not None and cached[:2] == signature:
-                            if candidate_path is not None and cached[3] == -1:
-                                cached = (*cached[:3], self._difference_hash(path))
-                            current[path] = cached
-                            continue
-                        hasher = hashlib.sha256()
-                        with path.open("rb") as source:
-                            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                                hasher.update(chunk)
-                        # -1 表示尚未请求；None 表示无法进行视觉匹配，
-                        # 例如图片是动图。
-                        visual_hash = (
-                            self._difference_hash(path)
-                            if candidate_path is not None
-                            else -1
-                        )
-                        # 文件若在并发操作中被替换，下次必须重新读取。
-                        after = path.stat()
-                        if signature != (after.st_size, after.st_mtime_ns):
-                            continue
-                        current[path] = (*signature, hasher.hexdigest(), visual_hash)
-                    except (OSError, RuntimeError):
-                        continue
-            self._packs[root] = current
-            while len(self._packs) > self.max_packs:
-                self._packs.popitem(last=False)
-            for path, (_, _, existing_digest, _) in current.items():
-                if digest == existing_digest:
-                    return ImageMatch(exact_path=path)
+            connection = self._connect(root)
+            self._refresh(connection, root)
+            row = connection.execute(
+                "SELECT p FROM files WHERE h=? LIMIT 1", (digest,)
+            ).fetchone()
+            if row is not None:
+                return ImageMatch(exact_path=Path(row[0]))
             if candidate_path is None:
                 return ImageMatch()
-            candidate_hash = self._difference_hash(candidate_path)
+
+            candidate_hash = self._difference_hash(Path(candidate_path))
             if candidate_hash is None:
                 return ImageMatch()
+            self._fill_visual_hashes(connection)
+
             closest = ImageMatch()
-            for path, (_, _, _, visual_hash) in current.items():
-                if visual_hash is None:
+            for path_text, stored in connection.execute(
+                "SELECT p, v FROM files WHERE v IS NOT NULL AND v <> ?",
+                (_DHASH_UNSET,),
+            ):
+                value = _to_unsigned(stored)
+                if value is None:
                     continue
-                distance = (candidate_hash ^ visual_hash).bit_count()
+                distance = (candidate_hash ^ value).bit_count()
                 if distance <= 5 and (
                     closest.distance is None or distance < closest.distance
                 ):
-                    closest = ImageMatch(similar_path=path, distance=distance)
+                    closest = ImageMatch(similar_path=Path(path_text), distance=distance)
             return closest

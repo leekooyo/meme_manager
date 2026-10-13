@@ -129,7 +129,7 @@ CAPTION_RETRY_PROMPT = """
 身份不确定就省略，只根据画面、动作和文字还原聊天用法。
 只返回：{"caption":"一到两句中文核心梗义和使用场景","tags":["6到10个细粒度中文标签"],"visible_text":"图中原文或空字符串","category_fit":"match、uncertain、conflict 三选一","category_review_reason":"match 时留空，其他情况简述原因","suggested_category":"仅 conflict 时填写现有分类键，否则留空"}"""
 
-MAX_GIF_FRAMES = 5
+MAX_GIF_FRAMES = 2  # [patcher:vision-cheap] 原 5；免费模型仍抽帧，降帧加快响应
 CAPTION_TOOL_NAME = "submit_meme_caption"
 CAPTION_OUTPUT_MODE_CACHE_ATTR = "_meme_manager_caption_output_modes"
 

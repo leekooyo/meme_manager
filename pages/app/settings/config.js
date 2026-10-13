@@ -56,6 +56,15 @@ async function initPluginConfig() {
       description: "根据聊天平台选择适合的图片和消息格式。",
       prefixes: ["generation.message."],
     },
+    // [patcher:llm-free-random] 免模型发图分组（与 _conf_schema.json 的 generation.llm_free_random 一一对应）
+    {
+      id: "llm-free-random",
+      category: "sending",
+      title: "免模型发图",
+      description:
+        "不调用聊天模型，按概率主动发图。骰子1决定这一轮发不发，骰子2决定纯随机抽图还是让模型读用户消息选分类。",
+      prefixes: ["generation.llm_free_random."],
+    },
     {
       id: "semantic",
       category: "models",
@@ -100,6 +109,15 @@ async function initPluginConfig() {
       title: "频率与质量",
       description: "减少不必要的模型调用，保留更有把握的结果。",
       prefixes: ["auto_collect."],
+    },
+    // [patcher:gallery-capacity] 图库容量上限（与 _conf_schema.json 的 gallery_capacity 一一对应）
+    {
+      id: "gallery-capacity",
+      category: "collect",
+      title: "图库容量上限",
+      description:
+        "每个表情包最多保留多少张图片，超出后按进入时间删除最旧的一张。对手动上传、自动收集和整包导入共同生效。",
+      prefixes: ["gallery_capacity."],
     },
     {
       id: "storage",
@@ -225,6 +243,8 @@ async function initPluginConfig() {
       "留空时自动选择可用向量模型。更换模型后，可到语义化页面检查并重建索引。",
     "auto_collect.target_pack_id":
       "留空时跟随人设或会话规则。启用语义检索时，先进入待语义化列表。",
+    "gallery_capacity.max_images":
+      "0 表示不限。超出后按文件进入时间从最旧开始删除，可在群里用 /表情管理 清理超额 --dry 先看清单。",
   };
   const optionLabels = {
     cloudflare_r2: "Cloudflare R2",

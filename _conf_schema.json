@@ -340,6 +340,79 @@
     "description": "表情生成与发送",
     "type": "object",
     "items": {
+      "llm_free_random": {
+        "description": "免模型发图（不调用聊天模型，按概率主动发图）",
+        "type": "object",
+        "hint": "LLM 总闸关闭时的主动发图通道。插件 handler 在 LLM 判断之前执行，故不受 LLM 开关影响。骰子1决定这一轮发不发，骰子2决定纯随机抽图还是让模型读用户消息选分类。",
+        "items": {
+          "enabled": {
+            "description": "启用免模型发图",
+            "type": "bool",
+            "default": true,
+            "hint": "总开关。关闭后此通道完全停用，普通聊天仍按全局 LLM 设置走"
+          },
+          "active": {
+            "description": "主动模式（群里任意消息可触发）",
+            "type": "bool",
+            "default": true,
+            "hint": "开启后群里任意消息都可触发，不要求 @ 机器人或唤醒前缀；关闭则仅在 @机器人 / 私聊 / 带前缀时触发"
+          },
+          "probability": {
+            "description": "骰子1：每条消息的发图概率（%）",
+            "type": "float",
+            "default": 3,
+            "slider": { "min": 0, "max": 100, "step": 0.5 },
+            "hint": "支持小数。实测消息率约 10~12 条/分钟（所有会话合计）时，3% 约合每 3 分钟一张。0=不发，100=每条都发"
+          },
+          "exclude_categories": {
+            "description": "排除的分类目录名",
+            "type": "list",
+            "items": { "type": "string" },
+            "default": ["needs_review"],
+            "hint": "这些分类目录不会被随机抽中，也不会作为候选提供给选分类模型"
+          },
+          "api_enabled": {
+            "description": "启用「模型选分类」分支",
+            "type": "bool",
+            "default": true,
+            "hint": "关闭则骰子1命中后一律纯随机抽图，全程零模型调用"
+          },
+          "api_probability": {
+            "description": "骰子2：走模型选分类的概率（%）",
+            "type": "float",
+            "default": 100,
+            "slider": { "min": 0, "max": 100, "step": 5 },
+            "hint": "骰子1命中后按此比例分流：100 = 每次都交给模型选分类；调低则剩余部分纯随机抽图"
+          },
+          "api_provider_id": {
+            "description": "选分类使用的模型 Provider",
+            "type": "string",
+            "default": "zhipu/glm-4v-flash",
+            "_special": "select_provider",
+            "hint": "只用于读用户消息挑一个分类键，不产生可见文本，也不对外发送"
+          },
+          "api_timeout": {
+            "description": "模型调用超时（秒）",
+            "type": "float",
+            "default": 15,
+            "slider": { "min": 1, "max": 60, "step": 1 },
+            "hint": "超时即当作未命中，自动回落随机抽图，不会漏发"
+          },
+          "api_daily_limit": {
+            "description": "每日模型调用上限",
+            "type": "int",
+            "default": 0,
+            "hint": "超过后当天不再走模型选分类（仍可纯随机发图）；0 表示不限制"
+          },
+          "api_cooldown": {
+            "description": "同一会话最短调用间隔（秒）",
+            "type": "float",
+            "default": 60,
+            "slider": { "min": 0, "max": 600, "step": 5 },
+            "hint": "防止单个群刷屏把模型调用量顶上去；0 表示不限制"
+          }
+        }
+      },
       "trigger": {
         "description": "触发范围",
         "type": "object",
@@ -567,6 +640,25 @@
             "hint": "移除分段后内容中的指定内容"
           }
         }
+      }
+    }
+  },
+  "gallery_capacity": {
+    "description": "图库容量上限",
+    "type": "object",
+    "hint": "每个表情包最多保留多少张图片，超出后自动删除最旧的一张。",
+    "items": {
+      "enabled": {
+        "description": "启用容量清理",
+        "type": "bool",
+        "default": true,
+        "hint": "关掉后既不再自动清理，也不再响应手动清理指令"
+      },
+      "max_images": {
+        "description": "单包张数上限",
+        "type": "int",
+        "default": 10000,
+        "hint": "每个表情包最多保留的图片张数，0 表示不限；超出时按进入时间删除最旧"
       }
     }
   }

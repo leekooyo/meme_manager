@@ -78,6 +78,50 @@ PREVIEW_IMAGE_MAX_DIMENSION = 512
 IMG_HOST_STATUS_CACHE_TTL_SECONDS = 15
 PACK_IMPORT_SESSION_TTL_SECONDS = 60 * 60
 MAX_PACK_ARCHIVE_BYTES = 1024 * 1024 * 1024
+
+# [patcher:space-for-time] 预览缩略图磁盘缓存 + manifest 版本表缓存
+PREVIEW_CACHE_DIR = PLUGIN_DATA_DIR / "preview_cache"
+PREVIEW_RECIPE = f"{PREVIEW_IMAGE_MAX_DIMENSION}:webp82-v1"
+_PREVIEW_MANIFEST_CACHE: dict[tuple, dict[str, str]] = {}
+_PREVIEW_MANIFEST_CACHE_LIMIT = 4
+
+
+def _preview_cache_file(file_path) -> "Path | None":
+    """缩略图磁盘缓存路径：preview_cache/<2位>/<sha>.webp（同样式配方+文件身份）。"""
+    try:
+        stat = file_path.stat()
+    except OSError:
+        return None
+    identity = (
+        f"{file_path}:{stat.st_mtime_ns}:{stat.st_ctime_ns}:{stat.st_size}:"
+        f"{PREVIEW_RECIPE}"
+    )
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    return PREVIEW_CACHE_DIR / key[:2] / f"{key}.webp"
+
+
+def _preview_manifest_cache_key(root: Path) -> tuple:
+    """manifest 版本表的廉价指纹：各分类目录 mtime_ns。"""
+    signature: list[tuple] = []
+    try:
+        directories = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        directories = []
+    for directory in directories:
+        try:
+            signature.append((directory.name, directory.stat().st_mtime_ns))
+        except OSError:
+            continue
+    return (str(root), tuple(signature))
+
+
+# [patcher:page-cache] 分类清单按「分类目录 mtime_ns」进程内缓存
+#
+# _scan_pack_emojis() 会对每个分类目录 iterdir 并逐文件 is_file（本机 5951 张
+# ≈ 0.65 s），页面每次加载、每次保存/移动图片后都会重扫。
+# 目录内增删文件会改变该目录 mtime，故以目录 mtime 为键是安全的。
+_SCAN_EMOJI_CACHE: dict[tuple, list] = {}
+_SCAN_EMOJI_CACHE_LIMIT = 4096
 MAX_PACK_UPLOAD_REQUEST_BYTES = MAX_PACK_ARCHIVE_BYTES + 1024 * 1024
 COMMUNITY_INSTALL_JOB_TTL_SECONDS = 30 * 60
 
@@ -102,6 +146,17 @@ class WebAPIMixin:
         # 将所有路由委托给 _register_webui_api
         self._register_webui_api(
             "emoji", self._api_get_emojis, ["GET"], "获取所有分类的表情列表"
+        )
+        # [patcher:sort-all-view] 图片级文件时间戳（mtime = 进入文件夹的时间），
+        # 供管理页「按时间排序」使用。⚠️ 路由名必须避开 emoji/<category> 的
+        # 吞噬：动态路由正则 emoji/[^/]+ 会吃掉同命名空间的静态 GET 路由
+        # （emoji/delete 等能幸免全靠 POST 方法过滤），且核心重载时新路由
+        # 追加队尾，「注册在前」不可靠 —— 故用下划线命名。
+        self._register_webui_api(
+            "emoji_mtimes",
+            self._api_get_emoji_mtimes,
+            ["GET"],
+            "获取各分类表情的文件时间戳（排序用）",
         )
         self._register_webui_api(
             "emoji/<category>",
@@ -820,6 +875,7 @@ class WebAPIMixin:
 
     @staticmethod
     def _scan_pack_emojis(memes_dir: Path) -> dict:
+        # [patcher:page-cache] 按分类目录 mtime 缓存清单；返回值浅拷贝防污染
         emojis = {}
         if not memes_dir.is_dir():
             return emojis
@@ -827,17 +883,27 @@ class WebAPIMixin:
             if not category_dir.is_dir():
                 continue
             category = category_dir.name
-            files = []
-            for file_path in category_dir.iterdir():
-                if file_path.is_file() and file_path.suffix.lower() in {
-                    ".png",
-                    ".jpg",
-                    ".jpeg",
-                    ".gif",
-                    ".webp",
-                }:
-                    files.append(file_path.name)
-            emojis[category] = files
+            try:
+                cache_key = (str(category_dir), category_dir.stat().st_mtime_ns)
+            except OSError:
+                cache_key = None
+            files = _SCAN_EMOJI_CACHE.get(cache_key) if cache_key else None
+            if files is None:
+                files = []
+                for file_path in category_dir.iterdir():
+                    if file_path.is_file() and file_path.suffix.lower() in {
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                        ".gif",
+                        ".webp",
+                    }:
+                        files.append(file_path.name)
+                if cache_key is not None:
+                    if len(_SCAN_EMOJI_CACHE) >= _SCAN_EMOJI_CACHE_LIMIT:
+                        _SCAN_EMOJI_CACHE.clear()
+                    _SCAN_EMOJI_CACHE[cache_key] = files
+            emojis[category] = list(files)
         return emojis
 
     @staticmethod
@@ -895,6 +961,43 @@ class WebAPIMixin:
             if not isinstance(emoji_data[category], list):
                 emoji_data[category] = []
         return jsonify(emoji_data)
+
+    # [patcher:sort-all-view] 各分类表情的文件 mtime（进入文件夹的时间）。
+    # 响应 {category: {filename: mtime}}；无 managed_pack_id 时返回 {}，
+    # 前端据此退化为文件名排序。
+    @staticmethod
+    def _scan_pack_emoji_mtimes(memes_dir: Path) -> dict:
+        result = {}
+        if not memes_dir.is_dir():
+            return result
+        for category_dir in memes_dir.iterdir():
+            if not category_dir.is_dir():
+                continue
+            entries = {}
+            for file_path in category_dir.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() in {
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".gif",
+                    ".webp",
+                }:
+                    try:
+                        entries[file_path.name] = file_path.stat().st_mtime
+                    except OSError:
+                        continue
+            result[category_dir.name] = entries
+        return result
+
+    async def _api_get_emoji_mtimes(self):
+        view_context = self._resolve_webui_pack_view_context()
+        if view_context:
+            mtimes = await asyncio.to_thread(
+                self._scan_pack_emoji_mtimes, view_context["memes_dir"]
+            )
+        else:
+            mtimes = {}
+        return jsonify(mtimes)
 
     async def _api_bridge_auth_token(self):
         auth_header = request.headers.get("Authorization", "").strip()
@@ -1782,12 +1885,16 @@ class WebAPIMixin:
         context = context or self._resolve_runtime_pack_context()
         root = Path(context["memes_dir"]).resolve()
 
+        # [patcher:space-for-time] 去掉逐文件 resolve()（文件名来自 iterdir，
+        # 本就在 root 之下），并按分类目录 mtime 指纹缓存版本表。
+        cache_key = _preview_manifest_cache_key(root)
+
         def scan():
             # 目录遍历和文件状态查询不能阻塞事件循环。
             versions = {}
             for category, filenames in self._scan_pack_emojis(root).items():
                 for filename in filenames:
-                    path = (root / category / filename).resolve()
+                    path = root / category / filename
                     if not path.is_relative_to(root):
                         continue
                     try:
@@ -1798,6 +1905,13 @@ class WebAPIMixin:
                         continue
             return versions
 
+        versions = _PREVIEW_MANIFEST_CACHE.get(cache_key)
+        if versions is None:
+            versions = await asyncio.to_thread(scan)
+            if len(_PREVIEW_MANIFEST_CACHE) >= _PREVIEW_MANIFEST_CACHE_LIMIT:
+                _PREVIEW_MANIFEST_CACHE.clear()
+            _PREVIEW_MANIFEST_CACHE[cache_key] = versions
+
         concurrency = self._read_config_value(
             ("webui", "preview_concurrency"), default=2
         )
@@ -1807,7 +1921,7 @@ class WebAPIMixin:
             {
                 "pack_id": context["pack_id"],
                 "concurrency": concurrency,
-                "versions": await asyncio.to_thread(scan),
+                "versions": versions,
             }
         )
         response.headers["Cache-Control"] = "no-store"
@@ -1943,7 +2057,11 @@ class WebAPIMixin:
             return jsonify({"message": "图片不存在"}), 404
 
         try:
-            detail = get_image_semantic_detail(pack_dir, file_path)
+            # [patcher:page-cache] 读取单图语义要做元数据解析 + 目录查询，
+            # 移出事件循环，避免卡住其它请求与机器人收发。
+            detail = await asyncio.to_thread(
+                get_image_semantic_detail, pack_dir, file_path
+            )
             return jsonify(
                 {
                     "pack_id": pack_id,
@@ -2139,10 +2257,15 @@ class WebAPIMixin:
     async def _api_semantic_reviews(self):
         try:
             pack_id = await self._semantic_request_pack_id()
+            # [patcher:webui-reviews-cache] 目录扫描 + 逐文件哈希代价很高
+            # （实测约 17s / 5927 张），必须移出事件循环，否则独占整个后端
+            overview = await asyncio.to_thread(
+                get_category_review_overview, PACKS_DIR / pack_id
+            )
             return jsonify(
                 {
                     "pack_id": pack_id,
-                    **get_category_review_overview(PACKS_DIR / pack_id),
+                    **overview,
                 }
             ), 200
         except FileNotFoundError as exc:
@@ -2195,6 +2318,19 @@ class WebAPIMixin:
 
     @staticmethod
     def _build_preview_data_url(file_path) -> tuple[str, str]:
+        # [patcher:space-for-time] 命中磁盘缓存直接返回，避免重复 PIL 编码
+        cache_file = _preview_cache_file(file_path)
+        if cache_file is not None:
+            try:
+                cached_bytes = cache_file.read_bytes()
+            except OSError:
+                cached_bytes = b""
+            if cached_bytes:
+                return (
+                    "data:image/webp;base64,"
+                    + base64.b64encode(cached_bytes).decode("ascii"),
+                    "image/webp",
+                )
         resample_filter = getattr(
             getattr(PILImage, "Resampling", PILImage),
             "LANCZOS",
@@ -2209,7 +2345,18 @@ class WebAPIMixin:
                 image = image.convert("RGBA")
             output = io.BytesIO()
             image.save(output, format="WEBP", quality=82, method=4)
-        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        payload = output.getvalue()
+        if cache_file is not None:
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp_file = cache_file.with_name(
+                    cache_file.name + "." + secrets.token_hex(4) + ".tmp"
+                )
+                tmp_file.write_bytes(payload)
+                tmp_file.replace(cache_file)
+            except OSError:
+                pass
+        encoded = base64.b64encode(payload).decode("ascii")
         return f"data:image/webp;base64,{encoded}", "image/webp"
 
     async def _api_list_packs(self):

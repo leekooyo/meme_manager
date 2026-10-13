@@ -128,6 +128,9 @@ class AutoCollectManager:
         self.min_meme_confidence = max(
             0.0, min(1.0, float(config.get("min_meme_confidence", 0.85) or 0))
         )
+        # [patcher:only-marked] begin —— 只收集平台明确标记为表情的图片
+        self.only_marked_images = bool(config.get("only_marked_images", False))
+        # [patcher:only-marked] end
         self.min_category_confidence = max(
             0.0,
             min(1.0, float(config.get("min_category_confidence", 0.65) or 0)),
@@ -337,6 +340,10 @@ class AutoCollectManager:
                         else:
                             uncertain_images.append((image, False))
                     candidates = marked_images + uncertain_images
+        # [patcher:only-marked] begin
+        if self.only_marked_images:
+            candidates = [item for item in candidates if item[1]]
+        # [patcher:only-marked] end
         if self.queue.qsize() + len(self._snapshot_tasks) >= QUEUE_SIZE:
             self.counters["queue_full"] = self.counters.get("queue_full", 0) + 1
             logger.info(
@@ -898,7 +905,7 @@ class AutoCollectManager:
                 "image_urls": visual_paths,
                 "system_prompt": AUTO_COLLECT_SYSTEM_PROMPT,
                 "temperature": 0,
-                "max_tokens": 1400,
+                "max_tokens": 500,  # [patcher:vision-cheap] 免费视觉模型上限 1024，原 1400 会 HTTP 400
                 "response_format": {"type": "json_object"},
             }
             try:
@@ -1443,6 +1450,15 @@ class AutoCollectManager:
             finally:
                 self.plugin.semantic_task_manager.end_external_pack_operation(pack_id)
         if result["imported"]:
+            # [patcher:gallery-capacity] 入库后按每包上限回收超额（最旧优先，带防抖）
+            try:
+                from .gallery_capacity import enforce_pack_capacity
+
+                await asyncio.to_thread(
+                    enforce_pack_capacity, pack_id, reason="auto_collect"
+                )
+            except Exception as exc:
+                logger.warning("[meme_manager] 自动收集后容量检查失败：%s", exc)
             await self.plugin.reload_emotions()
         return result
 

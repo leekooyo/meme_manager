@@ -19,6 +19,19 @@ def _get_memes_root() -> Path:
     return Path(resolve_pack_context()["memes_dir"]).resolve()
 
 
+def _enforce_capacity_after_write(memes_dir) -> None:
+    """[patcher:gallery-capacity] 落盘后检查该包的容量上限。
+
+    任何异常都只记日志、绝不影响本次上传结果（上限只是看护，不是准入门槛）。
+    """
+    try:
+        from ..gallery_capacity import enforce_for_memes_dir
+
+        enforce_for_memes_dir(memes_dir, reason="upload")
+    except Exception as exc:
+        logger.warning("[meme_manager] 上传后容量检查失败：%s", exc)
+
+
 class DuplicateEmojiError(ValueError):
     """上传的表情已存在于目标分类时抛出。"""
 
@@ -221,6 +234,7 @@ def add_emoji_to_category(category, image_file):
             raise OSError(f"文件保存失败，{file_path} 大小为0")
 
         logger.info(f"文件成功保存到 {file_path}, 大小: {file_size} 字节")
+        _enforce_capacity_after_write(category_path.parent)
         return {"path": str(file_path), "filename": file_path.name}
 
     except Exception as e:
