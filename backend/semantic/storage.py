@@ -7,7 +7,10 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -203,6 +206,119 @@ def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+# [patcher:space-for-time] 图片内容 sha256 的持久化索引（空间换时间）
+#
+# 背景：scan_images() / get_category_review_overview() 会对 pack 内**每一张图**
+# 调用 file_sha256()，逐字节读满整包（本机 5940 张 / 2.96 GB ≈ 17~21 s），而它们
+# 只关心「这张图的内容摘要是否还是老的」，并不要求每次都重新读盘。
+#
+# 这里把「绝对路径 -> (size, mtime_ns, sha256)」落到 pack 同级的 SQLite：
+# size 与 mtime_ns 未变即直接复用旧摘要；文件一旦改动会自动重算。
+# 只服务**只读扫描**；校验类路径仍应直接调用 file_sha256()。
+_DIGEST_INDEX_DDL = (
+    "CREATE TABLE IF NOT EXISTS digests("
+    "  p TEXT PRIMARY KEY, s INTEGER, m INTEGER, h TEXT);"
+)
+_DIGEST_CONNECTIONS: "OrderedDict[Path, Any]" = OrderedDict()
+_DIGEST_LOCK = threading.RLock()
+_DIGEST_CONNECTION_LIMIT = 4
+_DIGEST_WRITE_BATCH = 256
+_digest_pending_writes = 0
+
+
+def _digest_index_file(pack_root: Path) -> Path:
+    """返回 pack 的摘要索引库：<plugin_data>/content_hash_index/<pack>.sqlite3。
+
+    入参 pack_root 是 pack 目录（<plugin_data>/packs/<pack>）。
+    结构不匹配时退回到 pack 内的隐藏文件（仅兜底，正常走不到）。
+    """
+    packs_dir = pack_root.parent
+    if packs_dir.name == "packs":
+        return packs_dir.parent / "content_hash_index" / (pack_root.name + ".sqlite3")
+    return pack_root / ".content_hash_index.sqlite3"
+
+
+def _digest_connection(pack_root: Path) -> Any:
+    """按 pack 复用 SQLite 连接（LRU 上限 _DIGEST_CONNECTION_LIMIT）。"""
+    db_file = _digest_index_file(pack_root)
+    with _DIGEST_LOCK:
+        connection = _DIGEST_CONNECTIONS.get(db_file)
+        if connection is None:
+            db_file.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(db_file, timeout=30, check_same_thread=False)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.executescript(_DIGEST_INDEX_DDL)
+            connection.commit()
+            _DIGEST_CONNECTIONS[db_file] = connection
+            while len(_DIGEST_CONNECTIONS) > _DIGEST_CONNECTION_LIMIT:
+                _old_file, _old_connection = _DIGEST_CONNECTIONS.popitem(last=False)
+                try:
+                    _old_connection.close()
+                except Exception:
+                    pass
+        _DIGEST_CONNECTIONS.move_to_end(db_file)
+        return connection
+
+
+def _pack_root_for_meme(path: Path) -> Path | None:
+    """从 <plugin_data>/packs/<pack>/memes/... 反推 <pack> 目录。"""
+    for parent in path.parents:
+        if parent.parent.name == "packs":
+            return parent
+    return None
+
+
+def cached_file_sha256(path: Path) -> str:
+    """file_sha256 的持久缓存版本：size/mtime_ns 未变则复用旧摘要。
+
+    ⚠️ 仅供只读扫描使用（scan_images / get_category_review_overview）。
+    缓存不可用时静默回落到 file_sha256()，不影响功能。
+    """
+    global _digest_pending_writes
+    pack_root = _pack_root_for_meme(path)
+    if pack_root is None:
+        return file_sha256(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return file_sha256(path)
+    key = str(path)
+    size = int(stat.st_size)
+    mtime = int(stat.st_mtime_ns)
+
+    connection = None
+    row = None
+    try:
+        connection = _digest_connection(pack_root)
+        with _DIGEST_LOCK:
+            row = connection.execute(
+                "SELECT h FROM digests WHERE p = ? AND s = ? AND m = ?",
+                (key, size, mtime),
+            ).fetchone()
+    except Exception:
+        connection = None
+        row = None
+    if row and row[0]:
+        return str(row[0])
+
+    digest = file_sha256(path)
+    if connection is not None:
+        try:
+            with _DIGEST_LOCK:
+                connection.execute(
+                    "INSERT OR REPLACE INTO digests(p, s, m, h) VALUES(?, ?, ?, ?)",
+                    (key, size, mtime, digest),
+                )
+                _digest_pending_writes += 1
+                if _digest_pending_writes >= _DIGEST_WRITE_BATCH:
+                    connection.commit()
+                    _digest_pending_writes = 0
+        except Exception:
+            pass
+    return digest
+
+
 def load_category_descriptions(pack_dir: Path | str) -> dict[str, str]:
     """读取图包分类描述，优先使用可编辑的 memes_data.json。"""
     root = Path(pack_dir).resolve()
@@ -248,15 +364,17 @@ def scan_images(pack_dir: Path | str) -> list[dict[str, str]]:
     memes_root = root / "memes"
     if not memes_root.is_dir():
         return []
+    # [patcher:space-for-time] memes_root.resolve() 提到循环外；摘要走持久缓存
+    memes_root_resolved = memes_root.resolve()
     found: list[dict[str, str]] = []
     for path in sorted(memes_root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
         try:
-            path.resolve().relative_to(memes_root.resolve())
+            path.resolve().relative_to(memes_root_resolved)
         except ValueError:
             continue
-        digest = file_sha256(path)
+        digest = cached_file_sha256(path)
         relative = path.relative_to(root).as_posix()
         category = path.parent.name
         entry_id = semantic_entry_id(digest, category, relative)
@@ -942,6 +1060,124 @@ def get_pack_semantic_summary(
     }
 
 
+def _same_content_paths_via_index(
+    root: Path, memes_root: Path, source: Path, digest: str
+) -> list[str]:
+    """[patcher:page-cache] 用持久摘要索引反查「同内容的其他图片」。
+
+    背景：原实现每打开一张图都要把整个 memes/ 目录 rglob 一遍并逐文件
+    resolve()+stat()（本机 5951 张 ≈ 4.3 s），仅为产出一句界面提示。
+    这里改为在 content_hash_index 里按内容摘要反查（≈ 3 ms）。
+
+    只对「有 semantic_metadata.json 的包」启用——这类包的索引由
+    scan_images() / get_category_review_overview() 顺带维护；
+    其余（小包、索引未建）回落到原始全量扫描，行为保持完全不变。
+    结果仅用于界面提示，不参与任何写操作或校验。
+    """
+    pack_root = _pack_root_for_meme(source)
+    if pack_root is not None and (root / "semantic_metadata.json").is_file():
+        rows = None
+        try:
+            connection = _digest_connection(pack_root)
+            with _DIGEST_LOCK:
+                rows = connection.execute(
+                    "SELECT p FROM digests WHERE h = ?", (digest,)
+                ).fetchall()
+        except Exception:
+            rows = None
+        if rows:
+            matches: set[str] = set()
+            for row in rows:
+                try:
+                    candidate = Path(str(row[0]))
+                except (TypeError, ValueError):
+                    continue
+                if candidate == source:
+                    continue
+                try:
+                    candidate.resolve().relative_to(memes_root)
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if not candidate.is_file():
+                    continue
+                try:
+                    matches.add(candidate.relative_to(root).as_posix())
+                except (OSError, ValueError):
+                    continue
+            return sorted(matches)
+
+    source_size = source.stat().st_size
+    fallback: list[str] = []
+    if memes_root.is_dir():
+        for candidate in sorted(memes_root.rglob("*")):
+            if (
+                candidate == source
+                or not candidate.is_file()
+                or candidate.suffix.lower() not in IMAGE_EXTENSIONS
+            ):
+                continue
+            try:
+                candidate.resolve().relative_to(memes_root)
+                if candidate.stat().st_size != source_size:
+                    continue
+                if file_sha256(candidate) == digest:
+                    fallback.append(candidate.relative_to(root).as_posix())
+            except (OSError, RuntimeError, ValueError):
+                continue
+    return fallback
+
+
+# [patcher:page-cache] 语义摘要缓存（页面查询专用）
+#
+# list_installed_packs() 每次都会对每个包调用
+# get_pack_semantic_summary(verify_files=False)，而它要解析整份
+# semantic_metadata.json（本机 7 MB ≈ 0.3~0.4 s）。管理页一次加载会请求三次
+# 图包列表接口 → 同一份 7 MB JSON 被反复解析。
+# 这里按「元数据 mtime_ns/size + image_count」做进程内缓存，只有元数据真的被
+# 改写才重算。verify_files=True 的校验路径不缓存。
+_SUMMARY_CACHE: dict[tuple, Any] = {}
+_SUMMARY_CACHE_LIMIT = 8
+_get_pack_semantic_summary_uncached = get_pack_semantic_summary
+
+
+def _summary_cache_key(root: Path, image_count: "int | None") -> "tuple | None":
+    metadata_file = root / "semantic_metadata.json"
+    try:
+        stat = metadata_file.stat()
+    except OSError:
+        return None
+    return (
+        str(root),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+        None if image_count is None else int(image_count),
+    )
+
+
+def get_pack_semantic_summary(
+    pack_dir: Path | str, image_count: int | None = None, *, verify_files: bool = True
+) -> dict[str, Any]:
+    """[patcher:page-cache] 见上方缓存说明；verify_files=True 时直接透传。"""
+    if verify_files:
+        return _get_pack_semantic_summary_uncached(
+            pack_dir, image_count, verify_files=verify_files
+        )
+    root = Path(pack_dir).resolve()
+    cache_key = _summary_cache_key(root, image_count)
+    if cache_key is not None:
+        cached = _SUMMARY_CACHE.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+    result = _get_pack_semantic_summary_uncached(
+        pack_dir, image_count, verify_files=verify_files
+    )
+    if cache_key is not None and isinstance(result, dict):
+        if len(_SUMMARY_CACHE) >= _SUMMARY_CACHE_LIMIT:
+            _SUMMARY_CACHE.clear()
+        _SUMMARY_CACHE[cache_key] = dict(result)
+    return result
+
+
 def get_image_semantic_detail(
     pack_dir: Path | str, image_path: Path | str
 ) -> dict[str, Any]:
@@ -959,28 +1195,16 @@ def get_image_semantic_detail(
     if not source.is_file():
         raise FileNotFoundError("图片不存在")
 
-    digest = file_sha256(source)
+    # [patcher:page-cache] 打开单张图片时不再对整包做 rglob+resolve+stat
+    # （本机 5951 张 ≈ 4.3 s，点击后要等数秒才有反馈）；改用持久摘要索引按
+    # 内容摘要反查「同内容的其他图片」。
+    digest = cached_file_sha256(source)
     relative_path = source.relative_to(root).as_posix()
     category = source.parent.name
     entry_id = semantic_entry_id(digest, category, relative_path)
-    same_content_paths: list[str] = []
-    source_size = source.stat().st_size
-    if memes_root.is_dir():
-        for candidate in sorted(memes_root.rglob("*")):
-            if (
-                candidate == source
-                or not candidate.is_file()
-                or candidate.suffix.lower() not in IMAGE_EXTENSIONS
-            ):
-                continue
-            try:
-                candidate.resolve().relative_to(memes_root)
-                if candidate.stat().st_size != source_size:
-                    continue
-                if file_sha256(candidate) == digest:
-                    same_content_paths.append(candidate.relative_to(root).as_posix())
-            except (OSError, RuntimeError, ValueError):
-                continue
+    same_content_paths = _same_content_paths_via_index(
+        root, memes_root, source, digest
+    )
 
     empty_result = {
         "status": "none",
@@ -2325,9 +2549,48 @@ def metadata_items(
     return sorted(items, key=item_sort_key)
 
 
+# [patcher:webui-reviews-cache] 审核总览进程内缓存
+# 逐文件 file_sha256 会读满整个图库（本机 5927 张 / 2.96GB，实测约 17s），
+# 而主页每次加载都会调用一次，必须缓存。
+_REVIEW_OVERVIEW_CACHE: dict[tuple, dict[str, Any]] = {}
+_REVIEW_OVERVIEW_CACHE_LIMIT = 4
+
+
+def _review_overview_cache_key(root: Path) -> tuple:
+    """构造审核总览的廉价变更指纹（只读目录/元数据 mtime，不解图）。
+
+    覆盖：文件清单（各目录 mtime_ns）+ 语义元数据快照（mtime_ns/size）。
+    """
+    signature: list[tuple] = []
+    memes_root = root / "memes"
+    if memes_root.is_dir():
+        directories = [memes_root]
+        try:
+            directories.extend(sorted(p for p in memes_root.iterdir() if p.is_dir()))
+        except OSError:
+            pass
+        for directory in directories:
+            try:
+                stat = directory.stat()
+            except OSError:
+                continue
+            signature.append((str(directory), stat.st_mtime_ns))
+    metadata_file = metadata_path(root)
+    try:
+        stat = metadata_file.stat()
+        signature.append((str(metadata_file), stat.st_mtime_ns, stat.st_size))
+    except OSError:
+        signature.append((str(metadata_file), 0, 0))
+    return (str(root), tuple(signature))
+
+
 def get_category_review_overview(pack_dir: Path | str) -> dict[str, Any]:
     """返回主页审核筛选所需的逐文件状态与统计。"""
     root = Path(pack_dir).resolve()
+    cache_key = _review_overview_cache_key(root)
+    cached = _REVIEW_OVERVIEW_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     empty_statistics = {
         "auto_match": 0,
         "needs_review": 0,
@@ -2354,17 +2617,19 @@ def get_category_review_overview(pack_dir: Path | str) -> dict[str, Any]:
     # 如果在此 reconcile + save 会用旧快照覆盖刚完成的模型结果。
     metadata = load_metadata(root) if metadata_path(root).is_file() else {"images": {}}
     images = metadata.get("images", {})
+    # [patcher:space-for-time] memes_root.resolve() 提到循环外；摘要走持久缓存
     items: list[dict[str, Any]] = []
     memes_root = root / "memes"
     if memes_root.is_dir():
+        memes_root_resolved = memes_root.resolve()
         for path in sorted(memes_root.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
             try:
-                path.resolve().relative_to(memes_root.resolve())
+                path.resolve().relative_to(memes_root_resolved)
             except ValueError:
                 continue
-            digest = file_sha256(path)
+            digest = cached_file_sha256(path)
             category = path.parent.name
             relative_path = path.relative_to(root).as_posix()
             entry_id = semantic_entry_id(digest, category, relative_path)
@@ -2413,12 +2678,16 @@ def get_category_review_overview(pack_dir: Path | str) -> dict[str, Any]:
     statistics["reclassified"] = sum(
         1 for item in items if item.get("reclassification_status")
     )
-    return {
+    result = {
         "available": bool(items),
         "semantic_status": semantic_status,
         "items": items,
         "statistics": statistics,
     }
+    if len(_REVIEW_OVERVIEW_CACHE) >= _REVIEW_OVERVIEW_CACHE_LIMIT:
+        _REVIEW_OVERVIEW_CACHE.clear()
+    _REVIEW_OVERVIEW_CACHE[cache_key] = result
+    return result
 
 
 def confirm_image_category(

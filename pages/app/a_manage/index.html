@@ -147,7 +147,26 @@
         显示更多
       </button>
       <div class="collection-review-footer">
-        <span id="collection-review-selection">已选 0 张</span>
+        <!-- [patcher:review-select-all] 审核弹窗底栏：一键全选 / 清空 -->
+        <div class="collection-review-selection-group">
+          <span id="collection-review-selection">已选 0 张</span>
+          <button
+            id="collection-review-select-all-btn"
+            variant="tonal"
+            type="button"
+            class="secondary"
+          >
+            全选
+          </button>
+          <button
+            id="collection-review-clear-selection"
+            variant="tonal"
+            type="button"
+            class="secondary"
+          >
+            清空
+          </button>
+        </div>
         <label
           ><input
             id="collection-review-remember"
@@ -338,6 +357,15 @@
               placeholder="搜索分类或图片名称"
               autocomplete="off"
             />
+          </label>
+          <!-- [patcher:sort-all-view] 排序方式：默认 / 最新优先 / 最早优先 -->
+          <label class="library-sort" for="library-sort-select">
+            <i class="fas fa-sort" aria-hidden="true"></i>
+            <select id="library-sort-select" aria-label="排序方式">
+              <option value="default">默认顺序</option>
+              <option value="newest">最新优先</option>
+              <option value="oldest">最早优先</option>
+            </select>
           </label>
           <span
             id="library-result-count"

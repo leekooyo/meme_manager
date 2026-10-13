@@ -329,6 +329,16 @@ def _load_manifest(pack_id: str) -> dict:
         return manifest
 
 
+# [patcher:page-cache] 图片计数按「分类目录 mtime_ns」进程内缓存
+#
+# list_installed_packs() 会对每个包调用 _count_images()，逐个 iterdir + is_file
+# （本机 5951 张 ≈ 0.7 s），而管理页一次加载会请求三次图包列表接口。
+# 目录内增/删文件都会改变该目录的 mtime，因此用目录 mtime 做键是安全的；
+# 只改文件内容不影响计数。
+_IMAGE_COUNT_CACHE: dict[tuple, int] = {}
+_IMAGE_COUNT_CACHE_LIMIT = 4096
+
+
 def _count_images(memes_dir: Path) -> int:
     if not memes_dir.is_dir():
         return 0
@@ -336,15 +346,26 @@ def _count_images(memes_dir: Path) -> int:
     for category_dir in memes_dir.iterdir():
         if not category_dir.is_dir():
             continue
-        for file_path in category_dir.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in {
-                ".png",
-                ".jpg",
-                ".jpeg",
-                ".gif",
-                ".webp",
-            }:
-                total += 1
+        try:
+            cache_key = (str(category_dir), category_dir.stat().st_mtime_ns)
+        except OSError:
+            continue
+        count = _IMAGE_COUNT_CACHE.get(cache_key)
+        if count is None:
+            count = 0
+            for file_path in category_dir.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() in {
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".gif",
+                    ".webp",
+                }:
+                    count += 1
+            if len(_IMAGE_COUNT_CACHE) >= _IMAGE_COUNT_CACHE_LIMIT:
+                _IMAGE_COUNT_CACHE.clear()
+            _IMAGE_COUNT_CACHE[cache_key] = count
+        total += count
     return total
 
 
@@ -1184,6 +1205,14 @@ def import_pack_archive(
             _restore_file_snapshot(REGISTRY_PATH, registry_snapshot)
             _restore_file_snapshot(SELECTION_RULES_PATH, rules_snapshot)
             raise
+
+        # [patcher:gallery-capacity] 整包导入后按每包上限回收超额（最旧优先）
+        try:
+            from ..gallery_capacity import enforce_pack_capacity
+
+            enforce_pack_capacity(pack_id, reason="import", force=True)
+        except Exception as exc:
+            logger.warning("[meme_manager] 导入后容量检查失败：%s", exc)
 
         return {
             "pack_id": pack_id,

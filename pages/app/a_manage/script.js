@@ -23,6 +23,7 @@ async function initApp() {
       managedPackId &&
       [
         "emoji",
+        "emoji_mtimes",
         "emotions",
         "meme_image",
         "meme_image_data",
@@ -76,6 +77,8 @@ async function initApp() {
     sort: document.getElementById("collection-review-sort"),
     status: document.getElementById("collection-review-status"),
     selectAll: document.getElementById("collection-review-select-all"),
+    selectAllBtn: document.getElementById("collection-review-select-all-btn"),
+    clearSelection: document.getElementById("collection-review-clear-selection"),
     accept: document.getElementById("collection-review-accept"),
     discard: document.getElementById("collection-review-discard"),
     more: document.getElementById("collection-review-more"),
@@ -206,6 +209,11 @@ async function initApp() {
     review.selectAll.indeterminate =
       !review.selectAll.checked &&
       items.some((item) => review.selected.has(item.id));
+    review.selectAllBtn.disabled =
+      review.busy ||
+      !items.length ||
+      items.every((item) => review.selected.has(item.id));
+    review.clearSelection.disabled = review.busy || !review.selected.size;
     review.more.hidden = items.length <= review.limit;
     document.getElementById(
       "collection-review-selection",
@@ -468,17 +476,29 @@ async function initApp() {
       collectionReview.limit = 24;
       renderCollectionReview();
     });
-  collectionReview.selectAll.addEventListener("change", () => {
-    for (const item of collectionReview.items.filter(
+  // [patcher:review-select-all] 审核弹窗底栏：显眼的「全选 / 清空」按钮
+  const collectionReviewVisibleItems = () =>
+    collectionReview.items.filter(
       (item) =>
         !collectionReview.filter.value ||
         (item.suggested_category || "needs_review") ===
           collectionReview.filter.value,
-    )) {
+    );
+  collectionReview.selectAll.addEventListener("change", () => {
+    for (const item of collectionReviewVisibleItems()) {
       if (collectionReview.selectAll.checked)
         collectionReview.selected.add(item.id);
       else collectionReview.selected.delete(item.id);
     }
+    renderCollectionReview();
+  });
+  collectionReview.selectAllBtn.addEventListener("click", () => {
+    for (const item of collectionReviewVisibleItems())
+      collectionReview.selected.add(item.id);
+    renderCollectionReview();
+  });
+  collectionReview.clearSelection.addEventListener("click", () => {
+    collectionReview.selected.clear();
     renderCollectionReview();
   });
   collectionReview.more.addEventListener("click", () => {
@@ -503,7 +523,22 @@ async function initApp() {
   let semanticReviewAvailable = false;
   let activeSemanticReviewFilter = "all";
   let librarySearch = "";
+  // [patcher:sort-all-view] 排序方式（default/newest/oldest，持久化）与「全部」视图
+  const LIBRARY_SORT_KEY = "meme_manager:library-sort";
+  const readLibrarySort = () => {
+    try {
+      const saved = localStorage.getItem(LIBRARY_SORT_KEY);
+      return saved === "newest" || saved === "oldest" ? saved : "default";
+    } catch (error) {
+      return "default";
+    }
+  };
+  let librarySort = readLibrarySort();
+  let libraryAllView = false;
+  let latestEmojiMtimes = {};
+  let allViewFlatPairs = [];
   const librarySearchInput = document.getElementById("library-search-input");
+  const librarySortSelect = document.getElementById("library-sort-select");
   const libraryLoadState = document.getElementById("library-load-state");
   const libraryLoadMessage = document.getElementById("library-load-message");
   const libraryRetryBtn = document.getElementById("library-retry-btn");
@@ -1697,6 +1732,8 @@ async function initApp() {
     closeImagePreview();
     const previousActivePackId = activeManagePackId;
     clearSelections();
+    // [patcher:sort-all-view] 换包后退出「全部」视图
+    libraryAllView = false;
     activeManagePackId = targetPackId;
     void loadCollectionReview();
     applySemanticReviewData({ available: false });
@@ -1858,6 +1895,90 @@ async function initApp() {
     updateSemanticReviewToolbar();
   }
 
+  // [patcher:split-promise-all] 审核状态相关的 DOM 类名（增量补标前先清理旧标记）
+  const REVIEW_STATUS_CLASSES = [
+    "review-auto_match",
+    "review-needs_review",
+    "review-manual_confirmed",
+    "review-manual_rejected",
+    "review-unchecked",
+    "review-reclassified",
+  ];
+
+  // [patcher:split-promise-all] 给单个表情项套用审核标记（幂等，可重复调用）
+  function decorateEmojiItemReview(emojiItem, category, emoji) {
+    const review = semanticReviewByPath.get(semanticReviewKey(category, emoji));
+    if (!semanticReviewAvailable || !review) return;
+    const reviewStatus = String(review.category_review_status || "unchecked");
+    const reclassificationStatus = String(review.reclassification_status || "");
+
+    emojiItem.classList.remove(...REVIEW_STATUS_CLASSES);
+    emojiItem.querySelector(".emoji-item-semantic-badge")?.remove();
+    emojiItem.classList.add(`review-${reviewStatus}`);
+    if (reclassificationStatus) {
+      emojiItem.classList.add("review-reclassified");
+    }
+    emojiItem.dataset.categoryReviewStatus = reviewStatus;
+
+    const semanticBadge = document.createElement("span");
+    semanticBadge.className = "emoji-item-semantic-badge";
+    const fixedCategoryTag = String(review.category_tag || `category:${category}`);
+    semanticBadge.textContent = `${fixedCategoryTag} · ${
+      reclassificationStatus ? "自动重分类 · " : ""
+    }${semanticReviewLabel(reviewStatus)}`;
+    const reviewReason = String(review.category_review_reason || "").trim();
+    semanticBadge.title = reclassificationStatus
+      ? `${semanticBadge.textContent}；${String(
+          review.reclassified_from_category || "原分类",
+        )} → ${String(
+          review.reclassified_to_category || category,
+        )}；原因：${String(
+          review.reclassification_reason || reviewReason,
+        )}`
+      : reviewStatus === "needs_review" && reviewReason
+      ? `${semanticBadge.textContent}；原因：${reviewReason}`
+      : semanticBadge.textContent;
+    emojiItem.appendChild(semanticBadge);
+  }
+
+  // [patcher:split-promise-all] 审核数据迟到后，就地补标（不重建 DOM、不打断操作）
+  function applySemanticReviewDecorations() {
+    const container = document.getElementById("emoji-categories");
+    if (!container) return;
+    container.querySelectorAll(".emoji-item").forEach((emojiItem) => {
+      const category = emojiItem.dataset.category;
+      const emoji = emojiItem.dataset.emoji;
+      if (category == null || emoji == null) return;
+      decorateEmojiItemReview(emojiItem, category, emoji);
+    });
+  }
+
+  // [patcher:split-promise-all] 后台拉取分类审核状态；到达后按当前视图就地补标。
+  // 不参与首屏关键路径 —— 首屏只等 emoji + emotions。
+  async function refreshSemanticReviewData(requestSequence, requestedPackId) {
+    let reviewResult;
+    try {
+      reviewResult = await apiGet("semantic/reviews");
+    } catch (error) {
+      console.warn("读取分类审核状态失败:", error);
+      return;
+    }
+    if (
+      requestSequence !== libraryLoadSequence ||
+      requestedPackId !== activeManagePackId
+    )
+      return;
+    applySemanticReviewData(reviewResult);
+    if (activeSemanticReviewFilter === "all" && !librarySearch) {
+      // 默认视图：条目集合不变，就地补标即可
+      applySemanticReviewDecorations();
+    } else {
+      // 处于审核筛选/搜索态：条目集合会变化，重渲染以套用筛选
+      displayCategories(latestEmojiData, latestTagDescriptions);
+      updateSidebar(latestEmojiData, latestTagDescriptions);
+    }
+  }
+
   // 获取表情包数据、描述和分类审核状态
   async function fetchEmojis({ propagateError = false } = {}) {
     previews.invalidate();
@@ -1871,13 +1992,11 @@ async function initApp() {
       .getElementById("emoji-categories")
       .setAttribute("aria-busy", "true");
     try {
-      const [emojiResponse, tagDescriptions, reviewResult] = await Promise.all([
+      // [patcher:split-promise-all] 首屏关键路径只等 emoji + emotions；
+      // semantic/reviews 改为后台异步，避免 6~21s 的审核总览把首屏锁死。
+      const [emojiResponse, tagDescriptions] = await Promise.all([
         apiGet("emoji"),
         apiGet("emotions"),
-        apiGet("semantic/reviews").catch((error) => {
-          console.warn("读取分类审核状态失败:", error);
-          return { items: [], statistics: {} };
-        }),
       ]);
       if (
         requestSequence !== libraryLoadSequence ||
@@ -1888,12 +2007,32 @@ async function initApp() {
       closeBatchContextMenu();
       latestEmojiData = emojiResponse;
       latestTagDescriptions = tagDescriptions;
-      applySemanticReviewData(reviewResult);
+      latestEmojiMtimes = {};
       pruneSelectionState();
       displayCategories(emojiResponse, tagDescriptions);
       updateSidebar(emojiResponse, tagDescriptions);
       updateSelectionUI();
       libraryLoadState.classList.add("hidden");
+      // [patcher:split-promise-all] 审核数据回来后就地补标（不阻塞首屏）
+      void refreshSemanticReviewData(requestSequence, requestedPackId);
+      // [patcher:sort-all-view] 文件时间戳后台拉取（排序用）；失败静默退化
+      void (async () => {
+        try {
+          const mtimes = await apiGet("emoji_mtimes");
+          if (
+            requestSequence !== libraryLoadSequence ||
+            requestedPackId !== activeManagePackId
+          )
+            return;
+          latestEmojiMtimes =
+            mtimes && typeof mtimes === "object" ? mtimes : {};
+          if (librarySort !== "default") {
+            displayCategories(latestEmojiData, latestTagDescriptions);
+          }
+        } catch (error) {
+          console.warn("文件时间戳获取失败，排序退化为文件名序：", error);
+        }
+      })();
     } catch (error) {
       if (
         requestSequence !== libraryLoadSequence ||
@@ -4898,12 +5037,246 @@ async function initApp() {
   }
 
   // 根据数据生成 DOM 节点，展示每个分类及其表情包，并添加上传块
+  // ─────────────────────── [patcher:lazy-render] (start) ───────────────────
+  // 本地补丁（非上游代码）。大图库（单类上千张）原本在 displayCategories 里
+  // 一次性把整类 emoji 全建成 DOM（约 2.4 万节点）→ 主线程长任务、明显卡顿。
+  // 改为「滚动到哪、渲染到哪」：每个分类只先建外壳 + 一个哨兵；哨兵进入预载
+  // 范围才按 LAZY_RENDER_CHUNK 分块建真实 DOM，没滚到的分类完全不建。
+  const LAZY_RENDER_CHUNK = 48;
+  const LAZY_RENDER_PRELOAD_PX = 900;
+  let lazyRenderObserver = null;
+  const lazyRenderRecords = new Map();
+  const lazySentinelRecord = new WeakMap();
+  let currentCategoryEmojis = new Map();
+
+  function resetLazyRenderState() {
+    lazyRenderObserver?.disconnect();
+    lazyRenderObserver = null;
+    lazyRenderRecords.forEach((record) => {
+      if (record.raf) window.cancelAnimationFrame(record.raf);
+    });
+    lazyRenderRecords.clear();
+    currentCategoryEmojis = new Map();
+  }
+
+  function ensurePreviewObserver() {
+    if (previewObserver) return previewObserver;
+    previewObserver = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          entry.target.dataset.previewVisible = String(entry.isIntersecting);
+          if (entry.isIntersecting) {
+            void loadEmojiPreview(entry.target);
+          }
+        });
+      },
+      {
+        rootMargin: "220px 0px",
+        threshold: 0.01,
+      },
+    );
+    return previewObserver;
+  }
+
+  function ensureLazyRenderObserver() {
+    if (lazyRenderObserver) return lazyRenderObserver;
+    lazyRenderObserver = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          const record = lazySentinelRecord.get(entry.target);
+          if (record) fillLazyCategory(record);
+        });
+      },
+      {
+        rootMargin: `${LAZY_RENDER_PRELOAD_PX}px 0px`,
+        threshold: 0,
+      },
+    );
+    return lazyRenderObserver;
+  }
+
+  // [patcher:lazy-render] 逐个表情建 DOM（自 displayCategories 的 forEach 体原样抽出）。
+  function buildEmojiItem(category, emoji) {
+    const emojiItem = document.createElement("div");
+    emojiItem.className = "emoji-item";
+    emojiItem.dataset.category = category;
+    emojiItem.dataset.emoji = emoji;
+    emojiItem.dataset.suppressClick = "false";
+    emojiItem.dataset.loading = "false";
+    emojiItem.tabIndex = 0;
+    emojiItem.setAttribute("role", "group");
+    emojiItem.setAttribute(
+      "aria-label",
+      `${category} / ${emoji}，按回车预览`,
+    );
+
+    // [patcher:split-promise-all] 逐项审核标记抽成函数，供首屏渲染与
+    // 「审核数据迟到后增量补标」两处复用。
+    decorateEmojiItemReview(emojiItem, category, emoji);
+
+    const selectionIndicator = document.createElement("button");
+    selectionIndicator.type = "button";
+    selectionIndicator.className = "selection-indicator";
+    selectionIndicator.setAttribute("aria-label", "选择表情包");
+    emojiItem.appendChild(selectionIndicator);
+
+    // 删除按钮
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "delete-btn";
+    deleteBtn.innerHTML = "×";
+    deleteBtn.setAttribute("aria-label", `删除 ${emoji}`);
+    deleteBtn.onclick = (e) => {
+      e.stopPropagation();
+      deleteEmoji(category, emoji);
+    };
+    emojiItem.appendChild(deleteBtn);
+    bindEmojiInteractions(emojiItem, category, emoji);
+
+    setEmojiPreviewLoading(emojiItem);
+    return emojiItem;
+  }
+
+  function registerLazyCategory(category, emojis, grid, pairs = null) {
+    currentCategoryEmojis.set(category, emojis);
+    const sentinel = document.createElement("div");
+    sentinel.className = "emoji-lazy-sentinel";
+    sentinel.setAttribute("aria-hidden", "true");
+    sentinel.style.cssText =
+      "grid-column:1/-1;height:1px;margin:0;padding:0;pointer-events:none;";
+    grid.appendChild(sentinel);
+    const record = {
+      category,
+      emojis,
+      pairs, // [patcher:sort-all-view] 「全部」视图的 (category, emoji) 对
+      grid,
+      sentinel,
+      index: 0,
+      done: false,
+      raf: 0,
+    };
+    lazySentinelRecord.set(sentinel, record);
+    lazyRenderRecords.set(grid, record);
+    ensureLazyRenderObserver().observe(sentinel);
+  }
+
+  function scheduleLazyFill(record) {
+    if (record.done || record.raf) return;
+    record.raf = window.requestAnimationFrame(() => {
+      record.raf = 0;
+      fillLazyCategory(record);
+    });
+  }
+
+  function fillLazyCategory(record) {
+    if (!record || record.done) return;
+    if (
+      record.sentinel.getBoundingClientRect().top >
+      window.innerHeight + LAZY_RENDER_PRELOAD_PX
+    ) {
+      return; // 还没滚到附近：等 IntersectionObserver 或后续滚动触发
+    }
+    renderLazyChunk(record);
+    if (record.done) return;
+    if (
+      record.sentinel.getBoundingClientRect().top <
+      window.innerHeight + LAZY_RENDER_PRELOAD_PX
+    ) {
+      scheduleLazyFill(record);
+    }
+  }
+
+  function renderLazyChunk(record) {
+    if (record.done) return;
+    const { category, emojis, grid, sentinel } = record;
+    // [patcher:sort-all-view] 「全部」视图按 (category, emoji) 对渲染
+    const items = record.pairs || emojis.map((emoji) => [category, emoji]);
+    const start = record.index;
+    const end = Math.min(start + LAZY_RENDER_CHUNK, items.length);
+    const fragment = document.createDocumentFragment();
+    const created = [];
+    for (let i = start; i < end; i += 1) {
+      const item = buildEmojiItem(items[i][0], items[i][1]);
+      fragment.appendChild(item);
+      created.push(item);
+    }
+    grid.insertBefore(fragment, sentinel);
+    record.index = end;
+    const observer = ensurePreviewObserver();
+    created.forEach((item) => observer.observe(item));
+    if (selectionState.enabled) {
+      updateSelectionDecorations();
+    }
+    if (record.index >= items.length) {
+      record.done = true;
+      lazyRenderObserver?.unobserve(sentinel);
+      sentinel.remove();
+      lazyRenderRecords.delete(grid);
+    }
+  }
+
+  function kickLazyRenders() {
+    Array.from(lazyRenderRecords.values()).forEach((record) => {
+      fillLazyCategory(record);
+    });
+  }
+  // ─────────────────────── [patcher:sort-all-view] (start) ─────────────────
+  // 时间信号 = 后端 emoji_mtimes 的文件 mtime（进入文件夹的时间）；无 mtime
+  // 时退化为文件名内嵌 unix 时间戳前缀（10 位秒 / 13 位毫秒），再退化为文件名。
+  // 没有时间信号的图片一律沉底（升序 / 降序同样处理）。
+  function parseEmojiNameTimestamp(name) {
+    const match = /^(\d{10}|\d{13})_/.exec(String(name || ""));
+    if (!match) return null;
+    const raw = match[1];
+    return raw.length === 13 ? Number(raw) / 1000 : Number(raw);
+  }
+
+  function compareEmojiByTime(categoryA, emojiA, categoryB, emojiB) {
+    const direction = librarySort === "oldest" ? 1 : -1;
+    const timeA = Number(latestEmojiMtimes?.[categoryA]?.[emojiA]);
+    const timeB = Number(latestEmojiMtimes?.[categoryB]?.[emojiB]);
+    const hasA = Number.isFinite(timeA);
+    const hasB = Number.isFinite(timeB);
+    if (hasA && hasB && timeA !== timeB) return (timeA - timeB) * direction;
+    if (hasA !== hasB) return hasA ? -1 : 1; // 无 mtime 的沉底
+    const stampA = parseEmojiNameTimestamp(emojiA);
+    const stampB = parseEmojiNameTimestamp(emojiB);
+    if (stampA !== null && stampB !== null && stampA !== stampB) {
+      return (stampA - stampB) * direction;
+    }
+    if (stampA !== stampB) return stampA === null ? 1 : -1;
+    return String(emojiA).localeCompare(String(emojiB));
+  }
+
+  function sortEmojiList(category, emojis) {
+    if (librarySort === "default" || !Array.isArray(emojis)) return emojis;
+    return [...emojis].sort((a, b) =>
+      compareEmojiByTime(category, a, category, b),
+    );
+  }
+
+  function sortEmojiPairs(pairs) {
+    if (librarySort === "default" || !Array.isArray(pairs)) return pairs;
+    return [...pairs].sort((a, b) =>
+      compareEmojiByTime(a[0], a[1], b[0], b[1]),
+    );
+  }
+
+  function setLibraryAllView(next) {
+    const enabled = Boolean(next);
+    if (libraryAllView === enabled) return;
+    libraryAllView = enabled;
+    displayCategories(latestEmojiData, latestTagDescriptions);
+    updateSidebar(latestEmojiData, latestTagDescriptions);
+  }
+  // ─────────────────────── [patcher:sort-all-view] (end) ───────────────────
   function displayCategories(emojiData, tagDescriptions) {
     const container = document.getElementById("emoji-categories");
     previewObserver?.disconnect();
+    resetLazyRenderState(); // [patcher:lazy-render]
     container.innerHTML = "";
 
-    const categoryEntries = Object.entries(emojiData || {})
+    let categoryEntries = Object.entries(emojiData || {})
       .map(([category, emojis]) => {
         const categoryMatches = `${category} ${
           tagDescriptions?.[category] || ""
@@ -4940,6 +5313,11 @@ async function initApp() {
           (!librarySearch && activeSemanticReviewFilter === "all") ||
           emojis.length,
       );
+    // [patcher:sort-all-view] 类内按时间排序（默认档保持原文件名序）
+    categoryEntries = categoryEntries.map(([category, emojis]) => [
+      category,
+      sortEmojiList(category, emojis),
+    ]);
     const totalEmojiCount = categoryEntries.reduce((total, [, emojis]) => {
       return total + (Array.isArray(emojis) ? emojis.length : 0);
     }, 0);
@@ -5010,6 +5388,17 @@ async function initApp() {
       if (openCatalogLink) {
         openCatalogLink.href = buildCatalogPageUrl();
       }
+    }
+
+    // [patcher:sort-all-view] 「全部」视图：摊平所有分类混排，早退。
+    // 类别级操作 / 上传区 / 拖拽目标在混合视图下没有单一分类语义，不渲染。
+    if (libraryAllView) {
+      if (totalEmojiCount > 0) {
+        renderAllCategoriesView(categoryEntries);
+        kickLazyRenders();
+      }
+      updateSelectionDecorations();
+      return;
     }
 
     categoryEntries.forEach(([category, emojis]) => {
@@ -5098,84 +5487,10 @@ async function initApp() {
       const emojiGrid = document.createElement("div");
       emojiGrid.className = "emoji-grid";
 
-      // emojis 是数组
-      if (Array.isArray(emojis)) {
-        emojis.forEach((emoji) => {
-          const emojiItem = document.createElement("div");
-          emojiItem.className = "emoji-item";
-          emojiItem.dataset.category = category;
-          emojiItem.dataset.emoji = emoji;
-          emojiItem.dataset.suppressClick = "false";
-          emojiItem.dataset.loading = "false";
-          emojiItem.tabIndex = 0;
-          emojiItem.setAttribute("role", "group");
-          emojiItem.setAttribute(
-            "aria-label",
-            `${category} / ${emoji}，按回车预览`,
-          );
-
-          const review = semanticReviewByPath.get(
-            semanticReviewKey(category, emoji),
-          );
-          if (semanticReviewAvailable && review) {
-            const reviewStatus = String(
-              review.category_review_status || "unchecked",
-            );
-            const reclassificationStatus = String(
-              review.reclassification_status || "",
-            );
-            emojiItem.classList.add(`review-${reviewStatus}`);
-            if (reclassificationStatus) {
-              emojiItem.classList.add("review-reclassified");
-            }
-            emojiItem.dataset.categoryReviewStatus = reviewStatus;
-
-            const semanticBadge = document.createElement("span");
-            semanticBadge.className = "emoji-item-semantic-badge";
-            const fixedCategoryTag = String(
-              review.category_tag || `category:${category}`,
-            );
-            semanticBadge.textContent = `${fixedCategoryTag} · ${
-              reclassificationStatus ? "自动重分类 · " : ""
-            }${semanticReviewLabel(reviewStatus)}`;
-            const reviewReason = String(
-              review.category_review_reason || "",
-            ).trim();
-            semanticBadge.title = reclassificationStatus
-              ? `${semanticBadge.textContent}；${String(
-                  review.reclassified_from_category || "原分类",
-                )} → ${String(
-                  review.reclassified_to_category || category,
-                )}；原因：${String(
-                  review.reclassification_reason || reviewReason,
-                )}`
-              : reviewStatus === "needs_review" && reviewReason
-              ? `${semanticBadge.textContent}；原因：${reviewReason}`
-              : semanticBadge.textContent;
-            emojiItem.appendChild(semanticBadge);
-          }
-
-          const selectionIndicator = document.createElement("button");
-          selectionIndicator.type = "button";
-          selectionIndicator.className = "selection-indicator";
-          selectionIndicator.setAttribute("aria-label", "选择表情包");
-          emojiItem.appendChild(selectionIndicator);
-
-          // 删除按钮
-          const deleteBtn = document.createElement("button");
-          deleteBtn.className = "delete-btn";
-          deleteBtn.innerHTML = "×";
-          deleteBtn.setAttribute("aria-label", `删除 ${emoji}`);
-          deleteBtn.onclick = (e) => {
-            e.stopPropagation();
-            deleteEmoji(category, emoji);
-          };
-          emojiItem.appendChild(deleteBtn);
-          bindEmojiInteractions(emojiItem, category, emoji);
-
-          setEmojiPreviewLoading(emojiItem);
-          emojiGrid.appendChild(emojiItem);
-        });
+      // [patcher:lazy-render] 不再一次性建整类 DOM：登记为「滚到附近再分块渲染」，
+      // 首屏只建约「一屏 + 预载」的节点（原实现会一次建满整类，大图库明显卡顿）。
+      if (Array.isArray(emojis) && emojis.length) {
+        registerLazyCategory(category, emojis, emojiGrid);
       }
 
       if (activeSemanticReviewFilter === "all" && !librarySearch) {
@@ -5191,25 +5506,9 @@ async function initApp() {
       container.appendChild(categoryDiv);
     });
 
-    const lazyBackgrounds = container.querySelectorAll(".emoji-item");
-    previewObserver = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          entry.target.dataset.previewVisible = String(entry.isIntersecting);
-          if (entry.isIntersecting) {
-            void loadEmojiPreview(entry.target);
-          }
-        });
-      },
-      {
-        rootMargin: "220px 0px",
-        threshold: 0.01,
-      },
-    );
-
-    lazyBackgrounds.forEach((item) => {
-      previewObserver.observe(item);
-    });
+    // [patcher:lazy-render] 预览观察器已提前按需建立（ensurePreviewObserver），
+    // 分块渲染时逐项 observe；此处只需把首屏已在预载范围内的分类先填满。
+    kickLazyRenders();
 
     updateSelectionDecorations();
   }
@@ -5220,17 +5519,54 @@ async function initApp() {
     if (!sidebarList) return;
     sidebarList.innerHTML = "";
 
+    // [patcher:sort-all-view] 「全部」入口置顶：不分标签，混排所有分类的图片
+    const allItem = document.createElement("li");
+    const allLink = document.createElement("a");
+    allLink.href = "#";
+    allLink.className = "sidebar-all-entry";
+    allLink.textContent = "全部";
+    allLink.title = "显示所有分类的表情包（不分标签）";
+    if (libraryAllView) allLink.setAttribute("aria-current", "location");
+    allLink.addEventListener("click", (event) => {
+      event.preventDefault();
+      setLibraryAllView(true);
+      if (isCompactViewport()) {
+        closeAllPanels();
+        updatePanelToggleState();
+      }
+    });
+    allItem.appendChild(allLink);
+    sidebarList.appendChild(allItem);
+
     for (const category in data) {
-      if (!document.getElementById(`category-${category}`)) continue;
+      // 「全部」视图下没有分类分区 DOM，但目录仍要可点（点击即退回分类视图）
+      if (
+        !libraryAllView &&
+        !document.getElementById(`category-${category}`)
+      )
+        continue;
       const li = document.createElement("li");
       const a = document.createElement("a");
       a.href = "#category-" + category;
       a.textContent = category;
       a.title = tagDescriptions?.[category] || category;
-      a.addEventListener("click", () => {
+      a.addEventListener("click", (event) => {
         for (const link of sidebarList.querySelectorAll("a"))
           link.removeAttribute("aria-current");
         a.setAttribute("aria-current", "location");
+        if (libraryAllView) {
+          // 从「全部」退回分类视图并滚动到目标分类
+          event.preventDefault();
+          libraryAllView = false;
+          displayCategories(latestEmojiData, latestTagDescriptions);
+          updateSidebar(latestEmojiData, latestTagDescriptions);
+          const target = document.getElementById(`category-${category}`);
+          target?.scrollIntoView({ behavior: "smooth", block: "start" });
+          sidebarList
+            .querySelector(`a[href="#category-${category}"]`)
+            ?.setAttribute("aria-current", "location");
+          return;
+        }
         if (isCompactViewport()) {
           closeAllPanels();
           updatePanelToggleState();
@@ -5239,6 +5575,109 @@ async function initApp() {
       li.appendChild(a);
       sidebarList.appendChild(li);
     }
+  }
+
+  // [patcher:sort-all-view] 「全部」视图：摊平各分类为单一合成分区混排。
+  // 每张图仍带自己的分类（选择 / 审核 / 批量移动按 (category, emoji) 记账），
+  // 摊平只是展示层合并。上千项走原 IntersectionObserver 哨兵懒渲染。
+  function renderAllCategoriesView(categoryEntries) {
+    const container = document.getElementById("emoji-categories");
+    allViewFlatPairs = sortEmojiPairs(
+      categoryEntries.flatMap(([category, emojis]) =>
+        (Array.isArray(emojis) ? emojis : []).map((emoji) => [
+          category,
+          emoji,
+        ]),
+      ),
+    );
+
+    const categoryDiv = document.createElement("div");
+    categoryDiv.className = "category";
+    categoryDiv.id = "category-all";
+    categoryDiv.dataset.category = "all";
+    categoryDiv.dataset.allCategories = "true";
+
+    const titleDiv = document.createElement("div");
+    titleDiv.className = "category-title";
+    const headerDiv = document.createElement("div");
+    headerDiv.className = "category-header";
+    const titleMain = document.createElement("div");
+    titleMain.className = "category-title-main";
+    const categoryName = document.createElement("div");
+    categoryName.className = "category-name";
+    categoryName.textContent = "全部";
+    const selectionSummary = document.createElement("span");
+    selectionSummary.className = "category-selection-summary";
+    selectionSummary.textContent = "未开启批量选择";
+    titleMain.appendChild(categoryName);
+    titleMain.appendChild(selectionSummary);
+    const actionsDiv = document.createElement("div");
+    actionsDiv.className = "category-actions";
+    actionsDiv.appendChild(
+      createButton({
+        className: "select-all-category-btn",
+        text: "全选",
+        onClick: () => toggleAllViewSelection(),
+      }),
+    );
+    headerDiv.appendChild(titleMain);
+    headerDiv.appendChild(actionsDiv);
+    titleDiv.appendChild(headerDiv);
+    categoryDiv.appendChild(titleDiv);
+
+    const emojiGrid = document.createElement("div");
+    emojiGrid.className = "emoji-grid";
+    if (allViewFlatPairs.length) {
+      registerLazyCategory(
+        "all",
+        allViewFlatPairs.map((pair) => pair[1]),
+        emojiGrid,
+        allViewFlatPairs,
+      );
+    }
+    categoryDiv.appendChild(emojiGrid);
+    container.appendChild(categoryDiv);
+  }
+
+  function updateAllViewSelectionUI(categoryDiv) {
+    const totalCount = allViewFlatPairs.length;
+    const selectedCount = allViewFlatPairs.filter(([category, emoji]) =>
+      isEmojiSelected(category, emoji),
+    ).length;
+    const filtered =
+      Boolean(librarySearch) || activeSemanticReviewFilter !== "all";
+    const summary = categoryDiv.querySelector(".category-selection-summary");
+    const selectAllBtn = categoryDiv.querySelector(".select-all-category-btn");
+    const allSelected = totalCount > 0 && selectedCount === totalCount;
+    if (summary) {
+      summary.textContent = selectionState.enabled
+        ? `${filtered ? "可见项已选" : "已选"} ${selectedCount} / ${totalCount}`
+        : "未开启批量选择";
+    }
+    if (selectAllBtn) {
+      selectAllBtn.disabled = totalCount === 0;
+      selectAllBtn.textContent =
+        selectionState.enabled && allSelected ? "取消全选" : "全选";
+    }
+  }
+
+  function toggleAllViewSelection() {
+    if (allViewFlatPairs.length === 0) return;
+    if (!selectionState.enabled) {
+      setSelectionMode(true);
+    }
+    const allSelected = allViewFlatPairs.every(([category, emoji]) =>
+      isEmojiSelected(category, emoji),
+    );
+    allViewFlatPairs.forEach(([category, emoji]) => {
+      const selectionKey = createSelectionKey(category, emoji);
+      if (allSelected) {
+        selectionState.items.delete(selectionKey);
+      } else {
+        selectionState.items.set(selectionKey, { category, emoji });
+      }
+    });
+    updateSelectionUI();
   }
 
   function createSelectionKey(category, emoji) {
@@ -5321,11 +5760,23 @@ async function initApp() {
     });
 
     document.querySelectorAll(".category").forEach((categoryDiv) => {
+      // [patcher:sort-all-view] 「全部」合成分区：按 (category, emoji) 对计数
+      if (categoryDiv.dataset.allCategories === "true") {
+        updateAllViewSelectionUI(categoryDiv);
+        return;
+      }
       const category = categoryDiv.dataset.category;
-      const visibleItems = [...categoryDiv.querySelectorAll(".emoji-item")];
+      // [patcher:lazy-render] 懒渲染下 DOM 只含已渲染项 → 计数改用完整筛选列表，
+      // 否则「已选 X / Y」的分母会被截断成「已渲染的数量」。
+      const lazyList = currentCategoryEmojis.get(category);
+      const visibleItems = lazyList
+        ? lazyList
+        : [...categoryDiv.querySelectorAll(".emoji-item")].map(
+            (item) => item.dataset.emoji,
+          );
       const totalCount = visibleItems.length;
-      const selectedCount = visibleItems.filter((item) =>
-        isEmojiSelected(category, item.dataset.emoji),
+      const selectedCount = visibleItems.filter((emoji) =>
+        isEmojiSelected(category, emoji),
       ).length;
       const filtered =
         Boolean(librarySearch) || activeSemanticReviewFilter !== "all";
@@ -6746,6 +7197,23 @@ async function initApp() {
     displayCategories(latestEmojiData, latestTagDescriptions);
     updateSidebar(latestEmojiData, latestTagDescriptions);
   });
+  // [patcher:sort-all-view] 排序下拉：初始同步 + 切换即重渲染，选择持久化
+  if (librarySortSelect) {
+    librarySortSelect.value = librarySort;
+    librarySortSelect.addEventListener("change", () => {
+      librarySort =
+        librarySortSelect.value === "newest" ||
+        librarySortSelect.value === "oldest"
+          ? librarySortSelect.value
+          : "default";
+      try {
+        localStorage.setItem(LIBRARY_SORT_KEY, librarySort);
+      } catch (error) {
+        /* 隐私模式等场景下持久化失败不影响本次会话 */
+      }
+      displayCategories(latestEmojiData, latestTagDescriptions);
+    });
+  }
   libraryRetryBtn.addEventListener("click", () => {
     void fetchEmojis();
   });

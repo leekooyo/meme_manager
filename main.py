@@ -287,6 +287,14 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
 
     async def initialize(self) -> None:
         """Start collection on plugin reload as well as initial startup."""
+        # [patch:autocollect-boot-order] 插件早于 Provider 加载，此处探测会命中
+        # 核心的“Provider ... was not found”WARN。冷启动交给 on_astrbot_loaded
+        # 钩子在 Provider 就绪后补启动；热重载时 inst_map 非空、照常启动。
+        provider_manager = getattr(self.context, "provider_manager", None)
+        if provider_manager is not None and not getattr(
+            provider_manager, "inst_map", None
+        ):
+            return
         await self.auto_collect_manager.start()
 
     @filter.on_astrbot_loaded()

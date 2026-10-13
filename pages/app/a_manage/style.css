@@ -3851,6 +3851,10 @@ button.compact {
   color: var(--brand-strong);
   transform: none;
 }
+/* [patcher:sort-all-view] 侧边栏「全部」入口 */
+#sidebar-list li a.sidebar-all-entry {
+  font-weight: 600;
+}
 .sync-panel {
   padding: 14px;
   background: var(--bg);
@@ -3927,6 +3931,21 @@ button.danger,
   width: 100%;
   max-width: 420px;
   background: var(--bg);
+}
+/* [patcher:sort-all-view] 排序下拉 */
+.library-sort {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.library-sort select {
+  width: auto;
+  min-width: 116px;
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
 }
 .library-load-state {
   display: flex;
@@ -4237,8 +4256,14 @@ button.danger,
   background: var(--bg-color, #f5faf8);
   border-top: 1px solid #d5e6de;
 }
-.collection-review-footer > span {
+.collection-review-selection-group { /* [patcher:review-select-all] */
+  display: flex;
+  align-items: center;
+  gap: 12px;
   margin-right: auto;
+}
+.collection-review-selection-group > span {
+  white-space: nowrap;
 }
 #collection-review-more {
   margin-top: 16px;

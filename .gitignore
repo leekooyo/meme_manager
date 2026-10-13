@@ -180,3 +180,9 @@ cython_debug/
 # These files should never be committed to Git
 local/
 /data/
+# Local runtime files
+.ruff_cache/
+.env.*
+*.db
+*.sqlite*
+data/
