@@ -500,6 +500,13 @@
             <button id="delete-manage-pack-btn" class="danger" type="button">
               删除当前表情包
             </button>
+            <!-- [patcher:pack-admin] 图库新建 / 重命名 -->
+            <button id="create-pack-btn" type="button">
+              <i class="fas fa-folder-plus icon"></i>新建图库
+            </button>
+            <button id="rename-pack-btn" type="button" class="secondary">
+              <i class="fas fa-pen icon"></i>重命名当前图库
+            </button>
           </div>
         </details>
       </main>
@@ -663,6 +670,56 @@
             继续确认
           </button>
         </div>
+      </div>
+    </div>
+
+    <!-- [patcher:pack-admin] 新建 / 重命名图库对话框 -->
+    <div
+      id="pack-admin-modal"
+      class="confirm-modal hidden"
+      aria-hidden="true"
+      inert
+    >
+      <div
+        class="confirm-modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pack-admin-title"
+      >
+        <p class="confirm-modal-eyebrow">图库管理</p>
+        <h2 id="pack-admin-title">新建图库</h2>
+        <form id="pack-admin-form" class="pack-admin-form" autocomplete="off">
+          <label for="pack-admin-id">图库 ID（内部标识）</label>
+          <input
+            id="pack-admin-id"
+            type="text"
+            maxlength="64"
+            spellcheck="false"
+            placeholder="小写字母/数字/._-，2–64 位"
+          />
+          <label for="pack-admin-name">显示名称</label>
+          <input
+            id="pack-admin-name"
+            type="text"
+            maxlength="64"
+            placeholder="留空则使用 ID"
+          />
+          <label
+            id="pack-admin-default-wrap"
+            class="danger-modal-check"
+            for="pack-admin-set-default"
+          >
+            <input type="checkbox" id="pack-admin-set-default" />
+            <span>同时设为默认图库（影响未绑定会话的发图回落）</span>
+          </label>
+          <p id="pack-admin-hint" class="pack-admin-hint"></p>
+          <div class="confirm-modal-actions">
+            <button id="pack-admin-cancel-btn" type="button" class="secondary">
+              取消
+            </button>
+            <button id="pack-admin-submit-btn" type="submit">确定</button>
+          </div>
+        </form>
       </div>
     </div>
 

@@ -48,14 +48,19 @@ async function initApp() {
     const selectedPackId = String(
       activeManagePackId || managePackSelect?.value || "",
     ).trim();
+    // [patcher:active-pack-sync] 写操作目标包 = 后端「管理当前包」(active_pack_id)，
+    // 未设置时回落默认包（= 后端 resolve_pack_context 的兜底口径）。
+    // 两者不一致即拦截，避免把编辑误写到别的包。
+    const writeTargetPackId = syncedActivePackId || defaultManagePackId;
     if (
       selectedPackId &&
-      defaultManagePackId &&
-      selectedPackId !== defaultManagePackId &&
+      writeTargetPackId &&
+      selectedPackId !== writeTargetPackId &&
       ["emoji/", "category/"].some((prefix) => endpoint.startsWith(prefix))
     ) {
       throw new Error(
-        "当前为管理视图模式，仅支持浏览。请切回默认管理包后再执行编辑操作。",
+        `正在浏览「${selectedPackId}」，但编辑目标尚未同步过去。`
+          + "请重新在下拉框选择该图包以激活编辑。",
       );
     }
     if (selectedPackId && endpoint.startsWith("img_host/sync/")) {
@@ -768,6 +773,19 @@ async function initApp() {
   );
   const retryManagePacksBtn = document.getElementById("retry-manage-packs-btn");
   const deleteManagePackBtn = document.getElementById("delete-manage-pack-btn");
+  // [patcher:pack-admin] 图库新建 / 重命名
+  const createPackBtn = document.getElementById("create-pack-btn");
+  const renamePackBtn = document.getElementById("rename-pack-btn");
+  const packAdminModal = document.getElementById("pack-admin-modal");
+  const packAdminForm = document.getElementById("pack-admin-form");
+  const packAdminTitle = document.getElementById("pack-admin-title");
+  const packAdminId = document.getElementById("pack-admin-id");
+  const packAdminName = document.getElementById("pack-admin-name");
+  const packAdminSetDefault = document.getElementById("pack-admin-set-default");
+  const packAdminDefaultWrap = document.getElementById("pack-admin-default-wrap");
+  const packAdminHint = document.getElementById("pack-admin-hint");
+  const packAdminSubmitBtn = document.getElementById("pack-admin-submit-btn");
+  const packAdminCancelBtn = document.getElementById("pack-admin-cancel-btn");
   const transferCurrentPack = document.getElementById("transfer-current-pack");
   const exportModeInputs = Array.from(
     document.querySelectorAll('input[name="export-mode"]'),
@@ -815,7 +833,12 @@ async function initApp() {
   const packImportResult = document.getElementById("pack-import-result");
   let defaultManagePackId = "";
   let activeManagePackId = "";
+  // [patcher:active-pack-sync] 后端「管理当前包」(active_pack_id) 的前端镜像；写操作目标包
+  let syncedActivePackId = "";
   let managePacksById = new Map();
+  // [patcher:pack-admin] 图库新建 / 重命名对话框状态
+  let packAdminMode = "create";
+  let packAdminBusy = false;
   let pendingPackImportToken = "";
   let exportCapabilityRequestId = 0;
   let managePackVectorStatusRequestId = 0;
@@ -1556,6 +1579,10 @@ async function initApp() {
     try {
       const response = await apiGet("packs");
       const packs = Array.isArray(response?.packs) ? response.packs : [];
+      // [patcher:active-pack-sync] 回显后端「管理当前包」
+      syncedActivePackId = String(
+        response?.active_pack_id || "",
+      ).trim();
       managePacksById = new Map(
         packs.map((pack) => [String(pack?.id || "").trim(), pack]),
       );
@@ -1635,6 +1662,10 @@ async function initApp() {
     try {
       const response = await apiGet("packs");
       const packs = Array.isArray(response?.packs) ? response.packs : [];
+      // [patcher:active-pack-sync] 回显后端「管理当前包」
+      syncedActivePackId = String(
+        response?.active_pack_id || "",
+      ).trim();
       managePacksById = new Map(
         packs.map((pack) => [String(pack?.id || "").trim(), pack]),
       );
@@ -1687,10 +1718,16 @@ async function initApp() {
       const canUseUrlPack = packs.some(
         (item) => String(item?.id || "").trim() === managedPackIdFromUrl,
       );
+      // [patcher:active-pack-sync] 无 URL/偏好提示时，优先选中后端「管理当前包」
+      const canUseActive = packs.some(
+        (item) => String(item?.id || "").trim() === syncedActivePackId,
+      );
       if (canUsePreferred) {
         selectedPackId = preferred;
       } else if (canUseUrlPack) {
         selectedPackId = managedPackIdFromUrl;
+      } else if (canUseActive) {
+        selectedPackId = syncedActivePackId;
       }
       managePackSelect.value = selectedPackId;
       activeManagePackId = selectedPackId;
@@ -1713,6 +1750,15 @@ async function initApp() {
       showToast(error?.message || String(error), "error", "加载表情包失败");
       return [];
     }
+  }
+
+  // ---------- [patcher:active-pack-sync] 把 WebUI 正在管理的图包同步到后端「管理当前包」 ----------
+  // 使 emoji/category 写操作落到正确的包（与 QQ 指令 /表情管理 切换图库 共用状态）。
+  async function syncActivePack(packId) {
+    const normalized = String(packId || "").trim();
+    const data = await apiPost("packs/active", { pack_id: normalized });
+    syncedActivePackId = String(data?.active_pack_id || "").trim();
+    return syncedActivePackId;
   }
 
   async function switchManagePack() {
@@ -1740,6 +1786,8 @@ async function initApp() {
     updateManagePackSemanticAppearance(targetPackId);
     try {
       syncManagedPackQuery(targetPackId);
+      // [patcher:active-pack-sync] 切换即同步「管理当前包」，之后即可编辑
+      await syncActivePack(targetPackId);
       await refreshUi({ emojis: true });
       await refreshPackExportCapability(targetPackId);
       showToast(`已切换管理视图到 ${targetPackId}。`, "success", "切换成功");
@@ -1757,6 +1805,116 @@ async function initApp() {
     } finally {
       managePackSelect.disabled = false;
       void loadCollectionReview();
+    }
+  }
+
+  // ---------- [patcher:pack-admin] 新建 / 重命名图库 ----------
+  const PACK_ID_PATTERN = /^[a-z0-9._-]{2,64}$/;
+
+  function openPackAdminDialog(mode) {
+    if (!packAdminModal) return;
+    packAdminMode = mode === "rename" ? "rename" : "create";
+    const isCreate = packAdminMode === "create";
+    const current = String(activeManagePackId || "").trim();
+    if (packAdminTitle) {
+      packAdminTitle.textContent = isCreate ? "新建图库" : "重命名当前图库";
+    }
+    if (packAdminId) {
+      packAdminId.value = isCreate ? "" : current;
+      packAdminId.placeholder = isCreate
+        ? "小写字母/数字/._-，2–64 位"
+        : "留空或保持原 ID 则不改目录";
+    }
+    const currentPack = managePacksById.get(current);
+    if (packAdminName) {
+      packAdminName.value = isCreate ? "" : String(currentPack?.name || current);
+    }
+    if (packAdminSetDefault) {
+      packAdminSetDefault.checked = false;
+    }
+    if (packAdminDefaultWrap) {
+      packAdminDefaultWrap.classList.toggle("hidden", !isCreate);
+    }
+    if (packAdminSubmitBtn) {
+      packAdminSubmitBtn.textContent = isCreate ? "创建" : "保存修改";
+    }
+    if (packAdminHint) {
+      packAdminHint.textContent = isCreate
+        ? "将用标准分类表（19 类）初始化；创建后自动切换为「管理当前包」。"
+        : "重命名 ID 会迁移注册表、选择规则、收集来源与向量索引；该图库不能有进行中的语义任务。";
+    }
+    packAdminModal.classList.remove("hidden");
+    packAdminModal.setAttribute("aria-hidden", "false");
+    packAdminModal.inert = false;
+    window.requestAnimationFrame(() => packAdminId?.focus());
+  }
+
+  function closePackAdminDialog() {
+    if (!packAdminModal) return;
+    packAdminModal.classList.add("hidden");
+    packAdminModal.setAttribute("aria-hidden", "true");
+    packAdminModal.inert = true;
+  }
+
+  async function submitPackAdmin() {
+    if (packAdminBusy) return;
+    const isCreate = packAdminMode === "create";
+    const rawId = String(packAdminId?.value || "").trim().toLowerCase();
+    const rawName = String(packAdminName?.value || "").trim();
+    const current = String(activeManagePackId || "").trim();
+
+    if (isCreate && !PACK_ID_PATTERN.test(rawId)) {
+      showToast("ID 只能用小写字母/数字/._-，长度 2–64。", "warning", "格式不正确");
+      packAdminId?.focus();
+      return;
+    }
+    if (!isCreate && rawId && !PACK_ID_PATTERN.test(rawId)) {
+      showToast("新 ID 只能用小写字母/数字/._-，长度 2–64。", "warning", "格式不正确");
+      packAdminId?.focus();
+      return;
+    }
+    if (!isCreate && !current) {
+      showToast("当前没有可重命名的图库。", "warning", "无法重命名");
+      return;
+    }
+
+    packAdminBusy = true;
+    setButtonBusy(packAdminSubmitBtn, isCreate ? "创建中…" : "保存中…");
+    try {
+      const result = isCreate
+        ? await apiPost("packs/create", {
+            pack_id: rawId,
+            name: rawName,
+            set_default: Boolean(packAdminSetDefault?.checked),
+            set_active: true,
+          })
+        : await apiPost("packs/rename", {
+            pack_id: current,
+            new_pack_id: rawId && rawId !== current ? rawId : "",
+            new_name: rawName,
+          });
+      const nextPackId = String(result?.pack_id || rawId || current).trim();
+      closePackAdminDialog();
+      await refreshManagePackSummaries();
+      await loadManagePackSwitcher(nextPackId);
+      const warn =
+        Array.isArray(result?.warnings) && result.warnings.length
+          ? "（" + result.warnings.join("；") + "）"
+          : "";
+      showToast(
+        (isCreate ? "已创建图库 " : "已重命名图库 ") + nextPackId + warn,
+        "success",
+        isCreate ? "创建成功" : "重命名成功",
+      );
+    } catch (error) {
+      showToast(
+        error?.message || String(error),
+        "error",
+        isCreate ? "创建失败" : "重命名失败",
+      );
+    } finally {
+      packAdminBusy = false;
+      restoreButton(packAdminSubmitBtn);
     }
   }
 
@@ -7177,6 +7335,19 @@ async function initApp() {
   });
   packImportConfirmBtn?.addEventListener("click", () => {
     void confirmPackImport();
+  });
+  // [patcher:pack-admin] 新建 / 重命名图库接线
+  createPackBtn?.addEventListener("click", () => openPackAdminDialog("create"));
+  renamePackBtn?.addEventListener("click", () => openPackAdminDialog("rename"));
+  packAdminForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitPackAdmin();
+  });
+  packAdminCancelBtn?.addEventListener("click", () => closePackAdminDialog());
+  packAdminModal?.addEventListener("click", (event) => {
+    if (event.target === packAdminModal) {
+      closePackAdminDialog();
+    }
   });
   rebuildPackVectorsBtn?.addEventListener("click", () => {
     const packId = String(activeManagePackId || "").trim();

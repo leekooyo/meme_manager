@@ -404,9 +404,14 @@
   }
 }
 
+/* [patcher:round-ui] 面板与卡片圆润化（发送侧 / 收集侧共用） */
+.rules-panel {
+  border-radius: 20px;
+}
+
 .rules-list {
   display: grid;
-  gap: 10px;
+  gap: 12px;
 }
 
 .validation {
@@ -414,18 +419,25 @@
   border: 1px solid #f2cbc4;
   background: #fff7f5;
   color: #8b3225;
-  border-radius: 10px;
-  padding: 10px 12px;
+  border-radius: 14px;
+  padding: 12px 14px;
   font-size: 13px;
 }
 
 .rule-item {
-  border: 1px solid rgba(214, 229, 225, 0.96);
-  border-radius: 12px;
-  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
   display: grid;
-  gap: 10px;
+  gap: 0;
+  padding: 0;
   background: #fff;
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  transition: box-shadow 180ms ease, border-color 180ms ease;
+}
+
+.rule-item:hover {
+  box-shadow: 0 10px 26px rgb(29 64 48 / 8%);
 }
 
 .rule-item.dragging {
@@ -442,18 +454,34 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--line);
+  border-radius: 18px 18px 0 0;
+  background: linear-gradient(180deg, #f6faf8, #ffffff);
+}
+
+.rule-title-row strong {
+  color: var(--ink);
+  font-size: 14px;
 }
 
 .drag-handle {
-  border: 1px solid rgba(214, 229, 225, 0.96);
-  background: #f1f8f5;
+  border: 1px solid var(--line);
+  background: #fff;
   color: #305a62;
-  border-radius: 8px;
-  min-width: 36px;
-  min-height: 36px;
-  padding: 7px 10px;
+  border-radius: 999px;
+  min-width: 34px;
+  min-height: 34px;
+  padding: 6px 12px;
   font-size: 12px;
   cursor: grab;
+  transition: var(--transition);
+}
+
+.drag-handle:hover {
+  border-color: transparent;
+  background: var(--brand-soft);
+  color: var(--brand-strong);
 }
 
 .drag-handle:active {
@@ -462,13 +490,20 @@
 
 .rule-item.default {
   border-style: dashed;
+  border-color: #bfe0d2;
   background: var(--brand-soft);
+}
+
+.rule-item.default .rule-title-row {
+  border-bottom-color: #cfe8dd;
+  background: transparent;
 }
 
 .rule-grid {
   display: grid;
   grid-template-columns: minmax(110px, 0.8fr) minmax(0, 1.2fr);
-  gap: 12px;
+  gap: 14px;
+  padding: 16px 18px 18px;
 }
 
 .rule-grid .field-row:last-child {
@@ -479,6 +514,7 @@
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  padding: 0 18px 18px;
 }
 
 .rule-actions:empty {
@@ -518,12 +554,12 @@
 
 .rules-placeholder {
   margin: 0;
-  padding: 28px 16px;
+  padding: 30px 16px;
   text-align: center;
   color: var(--muted);
   background: #f7faf8;
   border: 1px dashed var(--line);
-  border-radius: 12px;
+  border-radius: 16px;
 }
 
 .validation ul {
@@ -533,6 +569,44 @@
 
 .validation li + li {
   margin-top: 4px;
+}
+
+/* [patcher:round-ui] 卡片内控件圆形化 */
+.rule-item input:not([type="checkbox"]),
+.rule-item select {
+  min-height: 42px;
+  padding: 9px 12px;
+  border-color: var(--line);
+  border-radius: 12px;
+  background: #fff;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.rule-item input:not([type="checkbox"]):focus,
+.rule-item select:focus {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgb(29 138 102 / 14%);
+}
+
+.rule-item select[multiple] {
+  min-height: 138px;
+  padding: 6px;
+  border-radius: 14px;
+  background: #fbfdfc;
+}
+
+.rule-item select[multiple] option {
+  margin: 2px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background-color: transparent;
+}
+
+.rule-item select[multiple] option:checked {
+  background-color: var(--brand-soft);
+  background-image: linear-gradient(0deg, var(--brand-soft), var(--brand-soft));
+  color: var(--brand-strong);
+  font-weight: 600;
 }
 
 .block {
@@ -554,8 +628,10 @@
 }
 
 .compact-btn {
-  padding: 6px 10px;
+  padding: 7px 14px;
+  border-radius: 999px;
   font-size: 12px;
+  font-weight: 550;
 }
 
 .pack-transfer-block {

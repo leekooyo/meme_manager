@@ -3979,6 +3979,31 @@ button.danger,
 .library-maintenance {
   margin-top: 24px;
 }
+/* [patcher:pack-admin] 新建/重命名图库对话框表单 */
+.pack-admin-form label {
+  display: block;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.pack-admin-form input[type="text"] {
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 8px;
+  font-size: 14px;
+  box-sizing: border-box;
+}
+.pack-admin-form .danger-modal-check {
+  margin-top: 14px;
+}
+.pack-admin-hint {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: pre-line;
+}
 #add-category-form label {
   display: block;
   margin-top: 10px;

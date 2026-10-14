@@ -39,6 +39,7 @@ from ..backend.packs.storage import (
     export_runtime_backup,
     fetch_and_cache_community_index,
     find_cached_pack_entry,
+    get_active_pack_id,
     get_pack_detail,
     get_pack_export_capabilities,
     get_selection_rules,
@@ -50,9 +51,11 @@ from ..backend.packs.storage import (
     list_installed_packs,
     load_cached_community_index,
     save_selection_rules,
+    set_active_pack_id,
     set_default_pack,
     uninstall_pack,
 )
+from ..backend.packs.admin_ops import create_pack, rename_pack
 from ..backend.plugin_settings import describe_settings, validate_settings_changes
 from ..backend.semantic.index import EmbeddingAdapter, index_is_ready
 from ..backend.semantic.storage import (
@@ -353,6 +356,13 @@ class WebAPIMixin:
             ["POST"],
             "设置默认表情包",
         )
+        # [patcher:active-pack-sync] WebUI 与 QQ 指令共用「管理当前包」
+        self._register_webui_api(
+            "packs/active",
+            self._api_set_active_pack,
+            ["POST"],
+            "设置管理当前包（WebUI 与 QQ 指令共用）",
+        )
         self._register_webui_api(
             "packs/export",
             self._api_export_pack,
@@ -388,6 +398,19 @@ class WebAPIMixin:
             self._api_apply_pack_import,
             ["POST"],
             "确认导入已预检的表情包",
+        )
+        # [patcher:pack-admin] 图库新建 / 重命名（id 迁移）
+        self._register_webui_api(
+            "packs/create",
+            self._api_create_pack,
+            ["POST"],
+            "新建图库（标准分类表初始化）",
+        )
+        self._register_webui_api(
+            "packs/rename",
+            self._api_rename_pack,
+            ["POST"],
+            "重命名图库（迁移显示名与内部 id）",
         )
         self._register_webui_api(
             "packs/uninstall",
@@ -2359,7 +2382,13 @@ class WebAPIMixin:
 
     async def _api_list_packs(self):
         try:
-            return jsonify({"packs": await asyncio.to_thread(list_installed_packs)})
+            packs = await asyncio.to_thread(list_installed_packs)
+            # [patcher:active-pack-sync] 附带「管理当前包」，供 WebUI 回显/判定可编辑性
+            try:
+                active_pack_id = await asyncio.to_thread(get_active_pack_id)
+            except Exception:
+                active_pack_id = ""
+            return jsonify({"packs": packs, "active_pack_id": active_pack_id})
         except Exception as e:
             logger.error(f"获取已安装表情包列表失败: {e}", exc_info=True)
             return jsonify({"message": f"获取已安装表情包列表失败: {str(e)}"}), 500
@@ -2764,6 +2793,25 @@ class WebAPIMixin:
             logger.error("删除全部语义化数据失败: %s", exc, exc_info=True)
             return jsonify({"message": "删除全部语义化数据失败"}), 500
 
+    # ---------- [patcher:active-pack-sync] 设置「管理当前包」 ----------
+    async def _api_set_active_pack(self):
+        """设置/清除 WebUI 与 QQ 指令共用的「管理当前包」(active_pack_id)。
+
+        写 selection_rules.json 顶层 active_pack_id；传空即清除（回落默认包）。
+        """
+        try:
+            data = await request.get_json()
+            pack_id = str((data or {}).get("pack_id") or "").strip()
+            result = await asyncio.to_thread(set_active_pack_id, pack_id)
+            return jsonify({"message": "管理当前包已切换", **result}), 200
+        except FileNotFoundError as e:
+            return jsonify({"message": str(e)}), 404
+        except ValueError as e:
+            return jsonify({"message": str(e)}), 400
+        except Exception as e:
+            logger.error(f"设置管理当前包失败: {e}", exc_info=True)
+            return jsonify({"message": f"设置管理当前包失败: {str(e)}"}), 500
+
     async def _api_set_default_pack(self):
         try:
             data = await request.get_json()
@@ -2781,6 +2829,59 @@ class WebAPIMixin:
         except Exception as e:
             logger.error(f"设置默认表情包失败: {e}", exc_info=True)
             return jsonify({"message": f"设置默认表情包失败: {str(e)}"}), 500
+
+    # ---------- [patcher:pack-admin] 图库新建 / 重命名 ----------
+    async def _api_create_pack(self):
+        try:
+            data = await request.get_json()
+            payload = data or {}
+            pack_id = str(payload.get("pack_id") or "").strip()
+            name = str(payload.get("name") or "").strip()
+            set_default = bool(payload.get("set_default"))
+            set_active_raw = payload.get("set_active")
+            set_active = True if set_active_raw is None else bool(set_active_raw)
+            result = await asyncio.to_thread(
+                create_pack,
+                pack_id,
+                name,
+                set_default=set_default,
+                set_active=set_active,
+            )
+            return jsonify({"message": "图库创建成功", **result}), 200
+        except FileExistsError as e:
+            return jsonify({"message": str(e)}), 409
+        except ValueError as e:
+            return jsonify({"message": str(e)}), 400
+        except Exception as e:
+            logger.error(f"新建图库失败: {e}", exc_info=True)
+            return jsonify({"message": f"新建图库失败: {str(e)}"}), 500
+
+    async def _api_rename_pack(self):
+        try:
+            data = await request.get_json()
+            payload = data or {}
+            old_pack_id = str(payload.get("pack_id") or "").strip()
+            new_pack_id = str(payload.get("new_pack_id") or "").strip()
+            new_name = str(payload.get("new_name") or "").strip()
+            if not old_pack_id:
+                return jsonify({"message": "pack_id 不能为空"}), 400
+            self._semantic_operation_guard(old_pack_id, "重命名图库")
+            result = await asyncio.to_thread(
+                rename_pack,
+                old_pack_id,
+                new_pack_id=new_pack_id,
+                new_name=new_name,
+            )
+            return jsonify({"message": "图库重命名完成", **result}), 200
+        except FileNotFoundError as e:
+            return jsonify({"message": str(e)}), 404
+        except RuntimeError as e:
+            return jsonify({"message": str(e)}), 409
+        except ValueError as e:
+            return jsonify({"message": str(e)}), 400
+        except Exception as e:
+            logger.error(f"重命名图库失败: {e}", exc_info=True)
+            return jsonify({"message": f"重命名图库失败: {str(e)}"}), 500
 
     async def _api_export_pack(self):
         try:

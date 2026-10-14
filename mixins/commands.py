@@ -1795,8 +1795,87 @@ class CommandMixin:
                 f"✅ 管理当前包已切到：{result['active_pack_id']}\n"
                 "之后「添加表情 / 查看图库 / 清空…」都作用于它。"
             )
-        else:
-            yield event.plain_result("✅ 已清除「管理当前包」，管理类指令回落默认图库。")
+    # ========== [patcher:pack-admin] 图库新建 / 重命名（2026-10-14）==========
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("新建图库")
+    async def create_gallery(self, event: AstrMessageEvent, raw: str = ""):
+        """新建图库：/表情管理 新建图库 <id> [显示名称]
+
+        ID 规则 ``[a-z0-9._-]``、2–64 位；用标准分类表（19 类）初始化；
+        创建后自动设为「管理当前包」。
+        """
+        from ..backend.packs.admin_ops import create_pack
+
+        text = self._gallery_raw_args(event, raw).strip()
+        tokens = text.split(None, 1)
+        pack_id = tokens[0].strip().lower() if tokens else ""
+        name = tokens[1].strip() if len(tokens) > 1 else ""
+        if not pack_id:
+            yield event.plain_result(
+                "📌 用法：/表情管理 新建图库 <id> [显示名称]\n"
+                "   ID 只能用小写字母/数字/._-，长度 2–64"
+            )
+            return
+        try:
+            result = await asyncio.to_thread(create_pack, pack_id, name)
+        except Exception as exc:
+            yield event.plain_result(f"❌ 创建失败：{exc}")
+            return
+        yield event.plain_result(
+            f"✅ 已新建图库：{result['pack_id']}"
+            f"（{result['name']}，{result['category_count']} 个分类）\n"
+            "已设为「管理当前包」，可继续用「添加表情」等管理指令。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("重命名图库")
+    async def rename_gallery(self, event: AstrMessageEvent, raw: str = ""):
+        """重命名图库：/表情管理 重命名图库 <新id|-> [新显示名称]
+
+        作用于「管理当前包」。``-`` 表示保持原 ID 只改显示名；
+        改 ID 会迁移注册表/选择规则/收集来源/向量索引，且该包不能有进行中的语义任务。
+        """
+        from ..backend.packs import storage as pack_storage
+        from ..backend.packs.admin_ops import rename_pack
+
+        current = await asyncio.to_thread(pack_storage.get_active_pack_id)
+        text = self._gallery_raw_args(event, raw).strip()
+        tokens = text.split(None, 1)
+        target = tokens[0].strip().lower() if tokens else ""
+        name = tokens[1].strip() if len(tokens) > 1 else ""
+        if not current:
+            yield event.plain_result(
+                "❌ 未设置「管理当前包」。请先 `/表情管理 切换图库 <包>` 再重命名。"
+            )
+            return
+        new_id = "" if target in {"-", "无", "keep", "none"} else target
+        if not new_id and not name:
+            yield event.plain_result(
+                "📌 用法：/表情管理 重命名图库 <新id|-> [新显示名称]\n"
+                f"   当前管理包：{current}"
+            )
+            return
+        try:
+            result = await asyncio.to_thread(
+                rename_pack, current, new_pack_id=new_id, new_name=name
+            )
+        except Exception as exc:
+            yield event.plain_result(f"❌ 重命名失败：{exc}")
+            return
+        lines = [
+            f"✅ 已重命名：{result['old_pack_id']} → {result['pack_id']}",
+            f"   显示名：{result['name']}",
+        ]
+        migrated = result.get("migrated") or {}
+        if migrated:
+            lines.append("   已迁移：" + "、".join(f"{k}×{v}" for k, v in migrated.items()))
+        for warn in result.get("warnings") or []:
+            lines.append(f"   ⚠️ {warn}")
+        yield event.plain_result("\n".join(lines))
+
+
+    # ========== [patcher:collect-mirror] 按来源配置收集目标（2026-10-13）==========
 
     # ========== [patcher:collect-mirror] 按来源配置收集目标（2026-10-13）==========
 
