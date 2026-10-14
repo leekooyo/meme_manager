@@ -16,10 +16,6 @@ from ..core.file_handler import (
 from ..interfaces.image_host import ImageHostInterface, ImageInfo
 
 
-class CloudflareR2Error(Exception):
-    """R2 adapter error."""
-
-
 class CloudflareR2Provider(ImageHostInterface):
     """Preserve full paths relative to the selected local image library."""
 
@@ -176,20 +172,6 @@ class CloudflareR2Provider(ImageHostInterface):
             file_path.resolve().relative_to(self.local_dir).as_posix()
         )
         return f"{self.prefix}/{relative}"
-
-    def _get_category_from_path(self, file_path: Path) -> str:
-        """Resolve the full category relative to the selected image library.
-
-        Args:
-            file_path: Local image.
-
-        Returns:
-            Relative category, or an empty string for root images.
-        """
-        relative = normalize_relative_path(
-            file_path.resolve().relative_to(self.local_dir).as_posix()
-        )
-        return relative.rpartition("/")[0]
 
     def _parse_s3_key(self, s3_key: str) -> tuple[str, str]:
         """Check object namespace boundaries and decode its portable path.

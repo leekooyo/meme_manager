@@ -273,19 +273,25 @@
         "slider": { "min": 1, "max": 2000, "step": 1 }
       },
       "scope": {
-        "description": "允许收集的群聊或个人 ID",
+        "description": "旧版收集来源（仅迁移）",
         "type": "list",
         "items": {
           "type": "string"
         },
         "default": [],
-        "hint": "留空表示全部来源。可填写原始 ID，也可用 group:群ID 或 user:用户ID 明确区分群聊和私聊"
+        "hint": "仅在首次迁移且尚无 collect_sources.json 时使用；留空不会放行全部来源。后续请在设置中心配置收集来源白名单"
       },
       "target_pack_id": {
-        "description": "目标表情包 ID",
+        "description": "旧版目标表情包（仅迁移）",
         "type": "string",
         "default": "",
-        "hint": "留空时使用当前会话按 session/persona/default 规则选中的表情包；填写后固定以该包的分类进行识别，待审核图片也归属该包"
+        "hint": "仅用于首次迁移旧版收集设置；后续请在设置中心为每个收集来源指定目标图库"
+      },
+      "only_marked_images": {
+        "description": "只收集平台明确标记的表情",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后只收集 QQ 平台明确标记为「表情」的图片，普通图片一律跳过；关闭（默认）时普通图片也进入渐进式识别流程"
       },
       "sampling_probability": {
         "description": "平台表情图片抽样概率（%）",

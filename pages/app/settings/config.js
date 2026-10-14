@@ -101,6 +101,7 @@ async function initPluginConfig() {
         "auto_collect.vision_provider_id",
         "auto_collect.scope",
         "auto_collect.target_pack_id",
+        "auto_collect.only_marked_images",
       ],
     },
     {

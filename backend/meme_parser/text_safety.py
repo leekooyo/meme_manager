@@ -212,30 +212,3 @@ def _protected_reference_spans(text: str) -> list[tuple[int, int]]:
         if _token_is_reference(match.group(0))
     )
     return _merge_spans(spans)
-
-
-def find_unprotected_word_spans(text: str, word: str) -> list[tuple[int, int]]:
-    """查找可安全用于旧版宽松情绪匹配的完整单词位置。"""
-
-    if not text or not word:
-        return []
-
-    protected_spans = _protected_reference_spans(text)
-    protected_index = 0
-    matches: list[tuple[int, int]] = []
-    pattern = re.compile(r"\b(" + re.escape(word) + r")\b")
-
-    for match in pattern.finditer(text):
-        start, end = match.span(1)
-        while (
-            protected_index < len(protected_spans)
-            and protected_spans[protected_index][1] <= start
-        ):
-            protected_index += 1
-        if protected_index < len(protected_spans):
-            protected_start, protected_end = protected_spans[protected_index]
-            if protected_start <= start and end <= protected_end:
-                continue
-        matches.append((start, end))
-
-    return matches

@@ -11,6 +11,18 @@ from astrbot_plugin_meme_manager.backend import auto_collect
 from test_auto_collect import DummyPlugin, png_bytes
 
 
+def _close_image_index():
+    """释放模块级图片索引缓存的 sqlite 连接，避免 Windows 临时目录清理时 WinError 32。"""
+    packs = getattr(auto_collect._IMAGE_INDEX, "_packs", None)
+    if isinstance(packs, dict):
+        for connection in list(packs.values()):
+            try:
+                connection.close()
+            except Exception:
+                pass
+        packs.clear()
+
+
 class AutoCollectReviewTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -45,6 +57,9 @@ class AutoCollectReviewTests(unittest.IsolatedAsyncioTestCase):
         self.plugin = DummyPlugin()
         self.plugin.semantic_enabled = False
         self.manager = auto_collect.AutoCollectManager(self.plugin, {"enabled": True})
+        # 新增的 sqlite 索引会持有文件句柄；须在临时目录清理前关闭，否则 Windows 报 WinError 32。
+        self.addAsyncCleanup(self.manager.close)
+        self.addCleanup(_close_image_index)
 
     async def add_candidate(self, color=(255, 0, 0), confidence=0.9):
         content = png_bytes(color)
@@ -52,7 +67,7 @@ class AutoCollectReviewTests(unittest.IsolatedAsyncioTestCase):
         source = self.root / f"{digest}.png"
         source.write_bytes(content)
         job = auto_collect.AutoCollectJob(
-            source, "pack-a", {"happy": "happy"}, "group", "1"
+            source, ["pack-a"], "pack-a", {"happy": "happy"}, "group", "1"
         )
         decision = {
             "is_meme": True,

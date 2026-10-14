@@ -304,8 +304,14 @@ def test_validate_and_normalize_selection_rules():
         {"id": "default", "scope": "default", "pack_id": "b"},
     ]
     assert storage._validate_and_normalize_rules(rules, {"a", "b"}) == [
-        {"id": "session", "scope": "session", "pack_id": "a", "target": "s1"},
-        {"id": "default", "scope": "default", "pack_id": "b"},
+        {
+            "id": "session",
+            "scope": "session",
+            "pack_id": "a",
+            "pack_ids": ["a"],
+            "target": "s1",
+        },
+        {"id": "default", "scope": "default", "pack_id": "b", "pack_ids": ["b"]},
     ]
 
 

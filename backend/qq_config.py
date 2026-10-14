@@ -95,6 +95,12 @@ PARAMS: list[dict] = [
        "每个表情包最多多少张，超出删最旧；0=不限", minimum=0, group="图库容量"),
     _p("容量清理开关", "gallery_capacity.enabled", "bool", True,
        "临时停用超额自动清理", group="图库容量"),
+    # ---- 图库绑定（selection）----
+    # ⚠️ 这条不走通用「写配置」链路：set_config_param 会把它转成
+    #    storage.set_default_pack()，直接改 selection_rules.json 的 default 规则
+    #    （唯一真相源），改完立即生效。
+    _p("默认图库", "selection.default_pack_id", "string", "stealer-migrated",
+       "未绑定会话回落的默认表情包 pack_id（改完立即生效）", group="图库绑定"),
 ]
 
 # 只读展示（Q6：涉及模型 / 索引 / 格式，误配会静默失效，禁止指令修改）

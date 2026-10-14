@@ -70,8 +70,15 @@ class CommandMixin:
         参数
         设置
         清理超额
+        绑定图库
+        解除图库
+        图库绑定
+        切换图库
+        收集开关
+        收集目标
+        收集状态
 
-        （另有独立指令「表情包」：全图库随机发一张）
+        （另有独立指令「表情包」：在本会话绑定的图库里随机发一张）
         """
         pass
 
@@ -1008,7 +1015,13 @@ class CommandMixin:
             return
 
         try:
-            memes_root = self._get_runtime_memes_dir_for_event(event)
+            # Q25=甲：非模型路径合并「该会话绑定集合」的全部候选池。
+            from ..backend.packs.resolver import get_pack_paths
+
+            pack_ids = self._get_runtime_pack_ids_for_event(event)
+            memes_roots = [
+                get_pack_paths(pack_id)["memes_dir"] for pack_id in pack_ids
+            ]
         except Exception as e:
             logger.error(f"[meme_manager] 免聊天模型发图：解析图库目录失败: {e}")
             return
@@ -1027,7 +1040,7 @@ class CommandMixin:
                 if not category:
                     route = "api_fallback"
 
-        picked = await self._llm_free_pick_image(memes_root, category, settings)
+        picked = await self._llm_free_pick_image(memes_roots, category, settings)
         if not picked:
             return
 
@@ -1156,9 +1169,17 @@ class CommandMixin:
     async def _llm_free_pick_image(
         self, memes_root, category: str = "", settings: dict = None
     ) -> str:
-        """按分类抽一张；无分类或该分类为空时回落全池随机。"""
-        root = Path(memes_root)
-        if not root.is_dir():
+        """按分类抽一张；无分类或该分类为空时回落全池随机。
+
+        `memes_root` 可传单个路径或路径列表（Q25=甲：非模型路径把多个绑定包的
+        同名分类合并成同一个候选池一起抽）。
+        """
+        if isinstance(memes_root, (list, tuple, set)):
+            roots = [Path(item) for item in memes_root if item]
+        else:
+            roots = [Path(memes_root)]
+        roots = [root for root in roots if root.is_dir()]
+        if not roots:
             return ""
 
         exclude = set(LLM_FREE_RANDOM_EXCLUDE_CATEGORIES)
@@ -1166,32 +1187,34 @@ class CommandMixin:
             exclude = settings.get("exclude_categories") or exclude
 
         if category:
-            try:
-                category_dir = resolve_safe_category_directory(memes_root, category)
-            except Exception:
-                category_dir = None
-            if category_dir and category_dir.is_dir():
-                names = [
-                    f
-                    for f in os.listdir(category_dir)
-                    if f.lower().endswith(IMAGE_EXTENSIONS)
-                ]
-                if names:
-                    return str(category_dir / random.choice(names))
+            category_candidates: list[str] = []
+            for root in roots:
+                try:
+                    category_dir = resolve_safe_category_directory(root, category)
+                except Exception:
+                    category_dir = None
+                if category_dir and category_dir.is_dir():
+                    category_candidates.extend(
+                        str(category_dir / name)
+                        for name in os.listdir(category_dir)
+                        if name.lower().endswith(IMAGE_EXTENSIONS)
+                    )
+            if category_candidates:
+                return random.choice(category_candidates)
 
         candidates: list[str] = []
-        try:
-            for category_dir in sorted(root.iterdir()):
-                if not category_dir.is_dir():
-                    continue
-                if category_dir.name in exclude:
-                    continue
-                for name in os.listdir(category_dir):
-                    if name.lower().endswith(IMAGE_EXTENSIONS):
-                        candidates.append(str(category_dir / name))
-        except Exception as e:
-            logger.error(f"[meme_manager] 免聊天模型发图：扫描图库失败: {e}")
-            return ""
+        for root in roots:
+            try:
+                for category_dir in sorted(root.iterdir()):
+                    if not category_dir.is_dir():
+                        continue
+                    if category_dir.name in exclude:
+                        continue
+                    for name in os.listdir(category_dir):
+                        if name.lower().endswith(IMAGE_EXTENSIONS):
+                            candidates.append(str(category_dir / name))
+            except Exception as e:
+                logger.error(f"[meme_manager] 免聊天模型发图：扫描图库失败: {e}")
 
         return random.choice(candidates) if candidates else ""
 
@@ -1229,7 +1252,9 @@ class CommandMixin:
         _RANDOM_MEME_LAST_HIT[cooldown_key] = now
 
         try:
-            picked = await asyncio.to_thread(self._random_meme_across_packs)
+            picked = await asyncio.to_thread(
+                self._random_meme_across_packs, event
+            )
         except Exception as exc:
             logger.error("[meme_manager] 「表情包」随机取图失败：%s", exc)
             picked = ""
@@ -1249,12 +1274,24 @@ class CommandMixin:
         logger.info("[meme_manager] 「表情包」指令命中：file=%s", picked)
         yield event.image_result(final_path)
 
-    def _random_meme_across_packs(self) -> str:
-        """在全部表情包里随机抽一张（跳过 needs_review 待审分类）。"""
+    def _random_meme_across_packs(self, event: AstrMessageEvent | None = None) -> str:
+        """在该会话绑定的表情包集合里随机抽一张（跳过 needs_review 待审分类）。
+
+        Q11=甲：由「跨全部包」收窄为「跨该群绑定集合」；未绑定走默认包。
+        """
         from ..backend.gallery_capacity import list_pack_ids, pack_memes_dir
 
+        pack_ids = None
+        if event is not None:
+            try:
+                pack_ids = self._get_runtime_pack_ids_for_event(event)
+            except Exception:
+                pack_ids = None
+        if not pack_ids:
+            pack_ids = list_pack_ids()
+
         candidates: list = []
-        for pack_id in list_pack_ids():
+        for pack_id in pack_ids:
             memes_dir = pack_memes_dir(pack_id)
             if not memes_dir.is_dir():
                 continue
@@ -1279,6 +1316,30 @@ class CommandMixin:
         return random.choice(candidates)
 
     # ========== [patcher:qq-config] 参数查看 / 修改 ==========
+    def _param_effective_value(self, spec: dict):
+        """读取参数的「当前实际值」。
+
+        [patcher:group-gallery] `selection.default_pack_id` 的真值**不在插件 config**
+        里，而在 `selection_rules.json` 的 default 规则上（`set_default_pack` 写那里）。
+        不特判的话，指令里会永远显示静态默认值，改过之后看着像没生效。
+        """
+        if spec.get("path") == "selection.default_pack_id":
+            try:
+                from ..backend.packs import storage as pack_storage
+
+                rule = pack_storage.get_pack_rule("default", "")
+            except Exception:
+                rule = None
+            if isinstance(rule, dict):
+                ids = rule.get("pack_ids")
+                if isinstance(ids, list) and ids:
+                    return str(ids[0])
+                single = str(rule.get("pack_id") or "").strip()
+                if single:
+                    return single
+        value = meme_qq.get_by_path(self.config, spec["path"])
+        return spec["default"] if value is None else value
+
     def _params_listing(self) -> str:
         """把可调 + 只读参数渲染成手机友好的清单。"""
         lines = ["🔧 表情包可调参数", "改法：/表情管理 设置 <参数名> <值>", ""]
@@ -1287,9 +1348,7 @@ class CommandMixin:
             if spec["group"] != current_group:
                 current_group = spec["group"]
                 lines.append(f"【{current_group}】")
-            value = meme_qq.get_by_path(self.config, spec["path"])
-            if value is None:
-                value = spec["default"]
+            value = self._param_effective_value(spec)
             lines.append(f"  {spec['alias']} = {meme_qq.format_value(spec, value)}")
         lines.append("")
         lines.append("【只读（指令不可改，请用插件面板）】")
@@ -1326,9 +1385,7 @@ class CommandMixin:
                 f"⚠️ 未收录参数「{token}」。\n用 /表情管理 参数 查看全部可调项。"
             )
             return
-        value = meme_qq.get_by_path(self.config, spec["path"])
-        if value is None:
-            value = spec["default"]
+        value = self._param_effective_value(spec)
         yield event.plain_result(
             f"🔧 {spec['alias']} = {meme_qq.format_value(spec, value)}\n"
             f"说明：{spec['desc']}\n"
@@ -1364,9 +1421,7 @@ class CommandMixin:
             return
 
         if not str(value or "").strip():
-            current = meme_qq.get_by_path(self.config, spec["path"])
-            if current is None:
-                current = spec["default"]
+            current = self._param_effective_value(spec)
             yield event.plain_result(
                 f"📌 用法：/表情管理 设置 {spec['alias']} <值>\n"
                 f"当前：{meme_qq.format_value(spec, current)}（{spec['desc']}）\n"
@@ -1378,6 +1433,23 @@ class CommandMixin:
         ok, parsed = meme_qq.parse_value(spec, value)
         if not ok:
             yield event.plain_result(f"❌ 「{spec['alias']}」设置失败：{parsed}")
+            return
+
+        if spec["path"] == "selection.default_pack_id":
+            # [patcher:group-gallery] 默认图库：直接改 selection_rules.json 的
+            # default 规则（唯一真相源），改完立即生效，无需重载插件。
+            from ..backend.packs import storage as pack_storage
+
+            try:
+                result = await asyncio.to_thread(
+                    pack_storage.set_default_pack, parsed
+                )
+            except Exception as exc:
+                yield event.plain_result(f"❌ 设置默认图库失败：{exc}")
+                return
+            yield event.plain_result(
+                f"✅ 默认图库已设为 {result['pack_id']}（改完立即生效）。"
+            )
             return
 
         previous = meme_qq.get_by_path(self.config, spec["path"])
@@ -1561,3 +1633,312 @@ class CommandMixin:
         else:
             lines.append(f"合计删除 {total} 张，明细见 logs/capacity_prune.jsonl。")
         yield event.plain_result("\n".join(lines))
+
+    # ========== [patcher:group-gallery] 按群绑定图库（2026-10-13）==========
+
+    def _gallery_raw_args(self, event: AstrMessageEvent, fallback: str = "") -> str:
+        """取「/表情管理 <子命令>」之后的原始参数字串。
+
+        指令框架按空格切分会截断多余参数（`-g 123` 会丢），因此这里直接从
+        原始消息里截取，保证 `绑定图库 a,b -g 123` 能完整解析。
+        """
+        text = ""
+        try:
+            text = str(event.get_message_str() or "")
+        except Exception:
+            text = ""
+        text = re.sub(r"\s+", " ", text).strip()
+        marker = "表情管理"
+        idx = text.find(marker)
+        if idx >= 0:
+            tail = text[idx + len(marker):].strip()
+            parts = tail.split(" ", 1)
+            return parts[1].strip() if len(parts) > 1 else ""
+        return str(fallback or "").strip()
+
+    def _gallery_target_from_args(self, event: AstrMessageEvent, raw: str) -> tuple:
+        """解析 [-g <群号>]；缺省时用当前会话（群聊即群号）。"""
+        text = str(self._gallery_raw_args(event, raw) or "").strip()
+        target = ""
+        match = re.search(r"(?:^|\s)-g\s+(\S+)", text)
+        if match:
+            target = match.group(1).strip()
+            text = (text[: match.start()] + " " + text[match.end():]).strip()
+        if not target:
+            target = str(getattr(event, "session_id", "") or "").strip()
+        return text, target
+
+    def _split_pack_tokens(self, raw: str) -> list:
+        return [
+            token.strip()
+            for token in re.split(r"[,，;；\s]+", str(raw or ""))
+            if token.strip()
+        ]
+
+    def _available_pack_ids(self) -> list:
+        try:
+            from ..backend.gallery_capacity import list_pack_ids
+
+            return [str(pid) for pid in list_pack_ids()]
+        except Exception:
+            return []
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("绑定图库")
+    async def bind_group_gallery(self, event: AstrMessageEvent, packs: str = ""):
+        """把当前群绑定到 1~多个表情包。
+
+        用法：/表情管理 绑定图库 <包>[,<包>…] [-g <群号>]
+        """
+        from ..backend.packs import storage as pack_storage
+
+        raw, target = self._gallery_target_from_args(event, packs)
+        if not target:
+            yield event.plain_result("❌ 请在群里使用，或用 -g <群号> 指定目标群。")
+            return
+        pack_ids = self._split_pack_tokens(raw)
+        if not pack_ids:
+            yield event.plain_result(
+                "📌 用法：/表情管理 绑定图库 <包>[,<包>…] [-g <群号>]\n"
+                f"可用图库：{', '.join(self._available_pack_ids()) or '(无)'}"
+            )
+            return
+        try:
+            result = await asyncio.to_thread(
+                pack_storage.upsert_pack_rule, "session", target, pack_ids
+            )
+        except Exception as exc:
+            yield event.plain_result(f"❌ 绑定失败：{exc}")
+            return
+        yield event.plain_result(
+            f"✅ 群 {target} 已绑定图库：{', '.join(result['pack_ids'])}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("解除图库")
+    async def unbind_group_gallery(self, event: AstrMessageEvent, extra: str = ""):
+        """清除当前群绑定，回落默认图库。
+
+        用法：/表情管理 解除图库 [-g <群号>]
+        """
+        from ..backend.packs import storage as pack_storage
+
+        _, target = self._gallery_target_from_args(event, extra)
+        if not target:
+            yield event.plain_result("❌ 请在群里使用，或用 -g <群号> 指定目标群。")
+            return
+        try:
+            removed = await asyncio.to_thread(
+                pack_storage.remove_pack_rule, "session", target
+            )
+        except Exception as exc:
+            yield event.plain_result(f"❌ 解除失败：{exc}")
+            return
+        if removed:
+            yield event.plain_result(f"✅ 群 {target} 的图库绑定已解除，回落默认图库。")
+        else:
+            yield event.plain_result(f"ℹ️ 群 {target} 本来就没有绑定图库。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("图库绑定")
+    async def show_group_gallery(self, event: AstrMessageEvent, extra: str = ""):
+        """查询当前群的图库绑定。
+
+        用法：/表情管理 图库绑定 [-g <群号>]
+        """
+        from ..backend.packs import storage as pack_storage
+        from ..backend.packs.resolver import resolve_pack_ids
+
+        _, target = self._gallery_target_from_args(event, extra)
+        if not target:
+            yield event.plain_result("❌ 请在群里使用，或用 -g <群号> 指定目标群。")
+            return
+        rule = await asyncio.to_thread(pack_storage.get_pack_rule, "session", target)
+        if rule:
+            pack_ids = rule.get("pack_ids") or (
+                [rule.get("pack_id")] if rule.get("pack_id") else []
+            )
+            yield event.plain_result(
+                f"📌 群 {target} 绑定图库：{', '.join(str(x) for x in pack_ids)}"
+            )
+            return
+        fallback = await asyncio.to_thread(resolve_pack_ids, target, None)
+        yield event.plain_result(
+            f"ℹ️ 群 {target} 未绑定，走默认图库：{', '.join(fallback)}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("切换图库")
+    async def switch_admin_gallery(self, event: AstrMessageEvent, pack: str = ""):
+        """设置全局「管理当前包」（添加表情/查看图库/清空… 作用于它）。
+
+        用法：/表情管理 切换图库 <包|默认>
+        """
+        from ..backend.packs import storage as pack_storage
+
+        token = str(pack or "").strip()
+        if not token:
+            current = await asyncio.to_thread(pack_storage.get_active_pack_id)
+            yield event.plain_result(
+                "📌 用法：/表情管理 切换图库 <包|默认>\n"
+                f"当前管理包：{current or '（跟随默认图库）'}\n"
+                f"可用图库：{', '.join(self._available_pack_ids()) or '(无)'}"
+            )
+            return
+        try:
+            result = await asyncio.to_thread(pack_storage.set_active_pack_id, token)
+        except Exception as exc:
+            yield event.plain_result(f"❌ 切换失败：{exc}")
+            return
+        if result["active_pack_id"]:
+            yield event.plain_result(
+                f"✅ 管理当前包已切到：{result['active_pack_id']}\n"
+                "之后「添加表情 / 查看图库 / 清空…」都作用于它。"
+            )
+        else:
+            yield event.plain_result("✅ 已清除「管理当前包」，管理类指令回落默认图库。")
+
+    # ========== [patcher:collect-mirror] 按来源配置收集目标（2026-10-13）==========
+
+    def _collect_source_key(self, event: AstrMessageEvent, raw: str) -> tuple:
+        """解析收集来源主键。
+
+        ``-g <群号>`` → ``group:<群号>``；否则取当前群聊 ID。私聊且未给 ``-g``
+        时返回错误提示（收集配置按群生效）。
+
+        Returns:
+            ``(source_key, error)``；``source_key`` 为空时 ``error`` 为提示语。
+        """
+        text = str(self._gallery_raw_args(event, raw) or "")
+        match = re.search(r"(?:^|\s)-g\s+(\S+)", text)
+        if match:
+            group_id = match.group(1).strip()
+            if not group_id.isdigit():
+                return "", f"❌ -g 需要纯数字群号，收到：{group_id}"
+            return f"group:{group_id}", ""
+        group_id = ""
+        try:
+            group_id = str(event.get_group_id() or "").strip()
+        except Exception:
+            group_id = ""
+        if group_id:
+            return f"group:{group_id}", ""
+        return "", "❌ 收集配置按群生效：请在群里使用，或用 -g <群号> 指定目标群。"
+
+    def _collect_payload(self, event: AstrMessageEvent, raw: str) -> str:
+        """取子命令参数里去掉 ``-g <群号>`` 之后的剩余部分。"""
+        return str(self._gallery_target_from_args(event, raw)[0] or "").strip()
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("收集开关")
+    async def toggle_collect_source(self, event: AstrMessageEvent, value: str = ""):
+        """开启/关闭某个群的表情包自动收集总闸。
+
+        用法：/表情管理 收集开关 <开|关> [-g <群号>]
+        """
+        from ..backend import collect_sources
+
+        key, error = self._collect_source_key(event, value)
+        if not key:
+            yield event.plain_result(error)
+            return
+        token = self._collect_payload(event, value)
+        opened = {"开", "on", "启用", "1", "true", "是"}
+        closed = {"关", "off", "停用", "0", "false", "否"}
+        if token.lower() not in opened and token.lower() not in closed:
+            entry = await asyncio.to_thread(collect_sources.get_source, key)
+            state = "开" if (entry or {}).get("enabled") else "关"
+            yield event.plain_result(
+                "📌 用法：/表情管理 收集开关 <开|关> [-g <群号>]\n"
+                f"{key} 当前：{state}"
+            )
+            return
+        enabled = token.lower() in opened
+        try:
+            entry = await asyncio.to_thread(collect_sources.set_enabled, key, enabled)
+        except Exception as exc:
+            yield event.plain_result(f"❌ 设置失败：{exc}")
+            return
+        packs = ", ".join(str(x) for x in (entry.get("packs") or [])) or "（默认图库）"
+        yield event.plain_result(
+            f"✅ {key} 自动收集已{'开启' if enabled else '关闭'}。\n"
+            f"镜像目标：{packs}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("收集目标")
+    async def set_collect_targets(self, event: AstrMessageEvent, packs: str = ""):
+        """设置某个群收集时把表情包**复制镜像**进哪些图库（可多个）。
+
+        用法：/表情管理 收集目标 <包>[,<包>…] [-g <群号>]
+        """
+        from ..backend import collect_sources
+
+        key, error = self._collect_source_key(event, packs)
+        if not key:
+            yield event.plain_result(error)
+            return
+        tokens = self._split_pack_tokens(self._collect_payload(event, packs))
+        entry = await asyncio.to_thread(collect_sources.get_source, key)
+        if not tokens:
+            current = ", ".join(str(x) for x in ((entry or {}).get("packs") or []))
+            gate = "开" if (entry or {}).get("enabled") else "关"
+            tips = ", ".join(self._available_pack_ids()) or "(无)"
+            yield event.plain_result(
+                "📌 用法：/表情管理 收集目标 <包>[,<包>…] [-g <群号>]\n"
+                f"{key} 当前目标：{current or '（默认图库，未设置）'}\n"
+                f"收集总闸：{gate}\n"
+                f"可用图库：{tips}"
+            )
+            return
+        available = set(self._available_pack_ids())
+        unknown = [token for token in tokens if token not in available]
+        if unknown:
+            tips = ", ".join(sorted(available)) or "(无)"
+            yield event.plain_result(
+                f"❌ 不存在的图库：{', '.join(unknown)}\n可用图库：{tips}"
+            )
+            return
+        try:
+            entry = await asyncio.to_thread(collect_sources.set_packs, key, tokens)
+        except Exception as exc:
+            yield event.plain_result(f"❌ 设置失败：{exc}")
+            return
+        gate = "开" if entry.get("enabled") else "关"
+        suffix = "" if entry.get("enabled") else "（用「收集开关 开」开启收集）"
+        yield event.plain_result(
+            f"✅ {key} 收集目标已设为："
+            f"{', '.join(str(x) for x in entry['packs'])}\n"
+            f"收集总闸：{gate}{suffix}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("收集状态")
+    async def show_collect_status(self, event: AstrMessageEvent, extra: str = ""):
+        """查询某个群的自动收集配置（总闸 + 镜像目标）。
+
+        用法：/表情管理 收集状态 [-g <群号>]
+        """
+        from ..backend import collect_sources
+
+        key, error = self._collect_source_key(event, extra)
+        if not key:
+            yield event.plain_result(error)
+            return
+        entry = await asyncio.to_thread(collect_sources.get_source, key)
+        default_packs = await asyncio.to_thread(collect_sources.default_packs)
+        defaults = ", ".join(str(x) for x in default_packs)
+        if not entry:
+            yield event.plain_result(
+                f"ℹ️ {key} 不在收集白名单中（不收图）。\n"
+                f"默认图库：{defaults}\n"
+                "开启：/表情管理 收集开关 开"
+            )
+            return
+        packs = ", ".join(str(x) for x in (entry.get("packs") or []))
+        gate = "开" if entry.get("enabled") else "关"
+        yield event.plain_result(
+            f"📌 {key} 收集配置\n"
+            f"总闸：{gate}\n"
+            f"镜像目标：{packs or f'（默认图库：{defaults}）'}"
+        )

@@ -176,29 +176,3 @@ def test_clear_all_handles_missing_root(tmp_path, monkeypatch):
     missing = tmp_path / "missing"
     monkeypatch.setattr(models, "resolve_pack_context", lambda: {"memes_dir": missing})
     assert models.clear_all_emojis() == {"deleted_by_category": {}}
-
-
-def test_update_emoji_replaces_supported_file(memes_root):
-    category = memes_root / "happy"
-    category.mkdir()
-    (category / "old.png").write_bytes(b"old")
-    assert models.update_emoji_in_category(
-        "happy", "old.png", SavedFile("new.webp", b"new")
-    )
-    assert not (category / "old.png").exists()
-    assert (category / "new.webp").read_bytes() == b"new"
-    assert not models.update_emoji_in_category(
-        "happy", "missing.png", SavedFile("new.png", b"new")
-    )
-    assert not models.update_emoji_in_category(
-        "missing", "old.png", SavedFile("new.png", b"new")
-    )
-
-
-@pytest.mark.parametrize("filename", ["", "bad.txt", "中文.png"])
-def test_update_emoji_rejects_unsafe_new_filename(memes_root, filename):
-    category = memes_root / "happy"
-    category.mkdir()
-    (category / "old.png").write_bytes(b"old")
-    with pytest.raises(ValueError):
-        models.update_emoji_in_category("happy", "old.png", SavedFile(filename, b"new"))

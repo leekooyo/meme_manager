@@ -587,7 +587,35 @@ class EventHandlerMixin:
         if random_value > self.emotions_probability:
             return [], []
 
-        memes_root = self._get_runtime_memes_dir_for_event(event)
+        pack_ids = self._get_runtime_pack_ids_for_event(event)
+        if not pack_ids:
+            return [], []
+
+        # Q26/Q31：模型选图路径从绑定集合随机抽 1 个包，整条链路只用该包。
+        # 各包分类表已统一（批次 0 迁移），因此抽哪个包不影响主提示词。
+        from ..backend.packs.resolver import get_pack_paths
+
+        pack_id = random.choice(pack_ids)
+        memes_root = get_pack_paths(pack_id)["memes_dir"]
+
+        def _category_images(category_dir) -> list[str]:
+            if category_dir is None or not category_dir.is_dir():
+                return []
+            return [
+                f
+                for f in os.listdir(category_dir)
+                if f.lower().endswith(IMAGE_EXTENSIONS)
+            ]
+
+        # Q34 兜底池：该包内所有「有图且非哨兵」的分类目录。
+        fallback_dirs = [
+            entry
+            for entry in sorted(memes_root.iterdir())
+            if entry.is_dir()
+            and entry.name != REVIEW_CATEGORY
+            and _category_images(entry)
+        ]
+
         emotion_images: list[Image] = []
         temp_files: list[str] = []
 
@@ -598,17 +626,17 @@ class EventHandlerMixin:
             try:
                 emotion_path = resolve_safe_category_directory(memes_root, emotion)
             except ValueError:
-                continue
-            if not emotion_path.is_dir():
-                continue
+                emotion_path = None
 
-            memes = [
-                f
-                for f in os.listdir(emotion_path)
-                if f.lower().endswith(IMAGE_EXTENSIONS)
-            ]
+            memes = _category_images(emotion_path)
             if not memes:
-                continue
+                # Q34：模型选中了该包没有图的分类 → 就地重抽该包的一个有图分类。
+                if not fallback_dirs:
+                    continue
+                emotion_path = random.choice(fallback_dirs)
+                memes = _category_images(emotion_path)
+                if not memes:
+                    continue
 
             meme = random.choice(memes)
             meme_file = str(emotion_path / meme)
@@ -1512,7 +1540,14 @@ class EventHandlerMixin:
         if not found_emotions:
             return
 
-        memes_root = self._get_runtime_memes_dir_for_event(event)
+        # [patcher:group-gallery] 模型路径：从该会话绑定集合随机抽 1 个包。
+        pack_ids = self._get_runtime_pack_ids_for_event(event)
+        if pack_ids:
+            from ..backend.packs.resolver import get_pack_paths
+
+            memes_root = get_pack_paths(random.choice(pack_ids))["memes_dir"]
+        else:
+            memes_root = Path(self._get_runtime_memes_dir_for_event(event))
 
         try:
             # 概率判定复用 _resp_impl 阶段的预检结果；extra 缺失时回退本地掷骰。
@@ -1524,6 +1559,23 @@ class EventHandlerMixin:
             if not legacy_probability_hit:
                 return
 
+            def _stream_images(category_dir) -> list:
+                if category_dir is None or not category_dir.is_dir():
+                    return []
+                return [
+                    f
+                    for f in os.listdir(category_dir)
+                    if f.lower().endswith(IMAGE_EXTENSIONS)
+                ]
+
+            stream_fallback_dirs = [
+                entry
+                for entry in sorted(memes_root.iterdir())
+                if entry.is_dir()
+                and entry.name != REVIEW_CATEGORY
+                and _stream_images(entry)
+            ]
+
             for emotion in self._limit_meme_selection(found_emotions):
                 if not emotion or emotion == REVIEW_CATEGORY:
                     continue
@@ -1531,17 +1583,17 @@ class EventHandlerMixin:
                 try:
                     emotion_path = resolve_safe_category_directory(memes_root, emotion)
                 except ValueError:
-                    continue
-                if not emotion_path.is_dir():
-                    continue
+                    emotion_path = None
 
-                memes = [
-                    f
-                    for f in os.listdir(emotion_path)
-                    if f.lower().endswith(IMAGE_EXTENSIONS)
-                ]
+                memes = _stream_images(emotion_path)
                 if not memes:
-                    continue
+                    # Q34：该包无此分类 → 就地重抽该包的一个有图分类。
+                    if not stream_fallback_dirs:
+                        continue
+                    emotion_path = random.choice(stream_fallback_dirs)
+                    memes = _stream_images(emotion_path)
+                    if not memes:
+                        continue
 
                 meme = random.choice(memes)
                 meme_file = str(emotion_path / meme)

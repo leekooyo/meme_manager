@@ -34,6 +34,7 @@ from ..semantic.storage import (
     save_metadata,
 )
 from .protocol import (
+    load_json_file,
     PACK_EXPORT_MODES,
     PACK_TRANSFER_FORMAT,
     PACK_TRANSFER_MANIFEST,
@@ -131,11 +132,8 @@ def _http_get_with_optional_acceleration(
 
 
 def _load_json(path: Path, default):
-    try:
-        with path.open(encoding="utf-8-sig") as file_obj:
-            return json.load(file_obj)
-    except Exception:
-        return default
+    # [patcher:orphan-cleanup] 收敛到 packs.protocol.load_json_file
+    return load_json_file(path, default)
 
 
 def _save_json(path: Path, data: dict) -> None:
@@ -563,10 +561,140 @@ def set_default_pack(pack_id: str) -> dict:
         for rule in selection_rules.get("rules", [])
         if str(rule.get("scope") or "") != "default"
     ]
-    rules.append({"id": "default", "scope": "default", "pack_id": pack_id})
+    rules.append(
+        {
+            "id": "default",
+            "scope": "default",
+            "pack_id": pack_id,
+            "pack_ids": [pack_id],
+        }
+    )
     selection_rules["rules"] = rules
     _save_selection_rules(selection_rules)
     return {"pack_id": pack_id}
+
+
+# ========== [patcher:group-gallery] 按群绑定图库（多包）==========
+
+
+def _normalize_pack_id_list(pack_ids) -> list[str]:
+    result: list[str] = []
+    if isinstance(pack_ids, (list, tuple, set)):
+        for item in pack_ids:
+            pack_id = str(item or "").strip()
+            if pack_id and pack_id not in result:
+                result.append(pack_id)
+    else:
+        pack_id = str(pack_ids or "").strip()
+        if pack_id:
+            result = [pack_id]
+    return result
+
+
+def get_pack_rule(scope: str, target: str) -> dict | None:
+    """读取指定 scope/target 的规则；不存在返回 None。"""
+    scope = str(scope or "").strip().lower()
+    target = str(target or "").strip()
+    for rule in _load_selection_rules().get("rules", []):
+        if not isinstance(rule, dict):
+            continue
+        if (
+            str(rule.get("scope") or "").strip().lower() == scope
+            and str(rule.get("target") or "").strip() == target
+        ):
+            return rule
+    return None
+
+
+def upsert_pack_rule(scope: str, target: str, pack_ids) -> dict:
+    """新增/覆盖一条 session|persona 规则（同一 target 只保留一条）。"""
+    scope = str(scope or "").strip().lower()
+    target = str(target or "").strip()
+    if scope not in {"session", "persona"}:
+        raise ValueError("scope 只能是 session 或 persona")
+    if not target:
+        raise ValueError("target 不能为空")
+
+    normalized_ids = _normalize_pack_id_list(pack_ids)
+    if not normalized_ids:
+        raise ValueError("至少需要一个 pack_id")
+    for pack_id in normalized_ids:
+        if not (PACKS_DIR / pack_id).is_dir():
+            raise FileNotFoundError(f"表情包 {pack_id} 不存在")
+
+    selection_rules = _load_selection_rules()
+    rules = [
+        rule
+        for rule in selection_rules.get("rules", [])
+        if not (
+            isinstance(rule, dict)
+            and str(rule.get("scope") or "").strip().lower() == scope
+            and str(rule.get("target") or "").strip() == target
+        )
+    ]
+    insert_at = len(rules)
+    for index, rule in enumerate(rules):
+        if str(rule.get("scope") or "").strip().lower() == "default":
+            insert_at = index
+            break
+    rules.insert(
+        insert_at,
+        {
+            "id": f"{scope}:{target}",
+            "scope": scope,
+            "target": target,
+            "pack_id": normalized_ids[0],
+            "pack_ids": list(normalized_ids),
+        },
+    )
+    selection_rules["rules"] = rules
+    _save_selection_rules(selection_rules)
+    return {"scope": scope, "target": target, "pack_ids": normalized_ids}
+
+
+def remove_pack_rule(scope: str, target: str) -> bool:
+    """删除指定 session|persona 规则；返回是否确实删除了内容。"""
+    scope = str(scope or "").strip().lower()
+    target = str(target or "").strip()
+    if scope not in {"session", "persona"} or not target:
+        raise ValueError("scope/target 非法")
+
+    selection_rules = _load_selection_rules()
+    rules = selection_rules.get("rules", [])
+    kept = [
+        rule
+        for rule in rules
+        if not (
+            isinstance(rule, dict)
+            and str(rule.get("scope") or "").strip().lower() == scope
+            and str(rule.get("target") or "").strip() == target
+        )
+    ]
+    if len(kept) == len(rules):
+        return False
+    selection_rules["rules"] = kept
+    _save_selection_rules(selection_rules)
+    return True
+
+
+def get_active_pack_id() -> str:
+    """管理类指令当前操作的包（全局一份）；未设置返回空串。"""
+    return str(_load_selection_rules().get("active_pack_id") or "").strip()
+
+
+def set_active_pack_id(pack_id: str) -> dict:
+    """设置/清除「管理当前包」。传空或 默认/重置 令牌即清除。"""
+    token = str(pack_id or "").strip()
+    selection_rules = _load_selection_rules()
+    if not token or token.lower() in {"默认", "default", "重置", "reset", "none", "清除"}:
+        selection_rules.pop("active_pack_id", None)
+        _save_selection_rules(selection_rules)
+        return {"active_pack_id": ""}
+    if not (PACKS_DIR / token).is_dir():
+        raise FileNotFoundError(f"表情包 {token} 不存在")
+    selection_rules["active_pack_id"] = token
+    _save_selection_rules(selection_rules)
+    return {"active_pack_id": token}
 
 
 def _archive_root_candidates(extract_root: Path) -> list[Path]:
@@ -1371,7 +1499,7 @@ def uninstall_pack(
     ]
 
     existing_pack_ids = (
-        {path.name for path in PACKS_DIR.iterdir() if path.is_dir()}
+        {path.name for path in PACKS_DIR.iterdir() if path.is_dir() and not path.name.startswith(".")}
         if PACKS_DIR.is_dir()
         else set()
     )
@@ -1775,24 +1903,44 @@ def _validate_and_normalize_rules(
 
         rule_id = str(rule.get("id") or "").strip()
         scope = str(rule.get("scope") or "").strip().lower()
-        pack_id = str(rule.get("pack_id") or "").strip()
         target = str(rule.get("target") or "").strip()
+
+        # 包集合：优先读 pack_ids（多包），向后兼容旧的单值 pack_id。
+        pack_ids: list[str] = []
+        raw_pack_ids = rule.get("pack_ids")
+        if isinstance(raw_pack_ids, list):
+            for item in raw_pack_ids:
+                candidate = str(item or "").strip()
+                if candidate and candidate not in pack_ids:
+                    pack_ids.append(candidate)
+        if not pack_ids:
+            single_pack_id = str(rule.get("pack_id") or "").strip()
+            if single_pack_id:
+                pack_ids = [single_pack_id]
 
         if not rule_id:
             raise ValueError(f"第 {index + 1} 条规则缺少 id")
         if scope not in {"persona", "session", "default"}:
             raise ValueError(f"第 {index + 1} 条规则 scope 非法")
-        if not pack_id:
+        if not pack_ids:
             raise ValueError(f"第 {index + 1} 条规则缺少 pack_id")
-        pack_exists = (
-            pack_id in available_pack_ids
-            if available_pack_ids is not None
-            else (PACKS_DIR / pack_id).is_dir()
-        )
-        if not pack_exists:
-            raise ValueError(f"第 {index + 1} 条规则引用的 pack 不存在: {pack_id}")
+        for candidate in pack_ids:
+            pack_exists = (
+                candidate in available_pack_ids
+                if available_pack_ids is not None
+                else (PACKS_DIR / candidate).is_dir()
+            )
+            if not pack_exists:
+                raise ValueError(
+                    f"第 {index + 1} 条规则引用的 pack 不存在: {candidate}"
+                )
 
-        normalized_rule = {"id": rule_id, "scope": scope, "pack_id": pack_id}
+        normalized_rule = {
+            "id": rule_id,
+            "scope": scope,
+            "pack_id": pack_ids[0],
+            "pack_ids": list(pack_ids),
+        }
         if scope in {"persona", "session"}:
             if not target:
                 raise ValueError(f"第 {index + 1} 条规则缺少 target")
@@ -1945,7 +2093,7 @@ def import_runtime_backup(
                     )
 
         current_pack_ids = (
-            {path.name for path in PACKS_DIR.iterdir() if path.is_dir()}
+            {path.name for path in PACKS_DIR.iterdir() if path.is_dir() and not path.name.startswith(".")}
             if PACKS_DIR.is_dir()
             else set()
         )

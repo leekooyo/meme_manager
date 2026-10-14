@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from ..meme_parser import MemeParser
 
 SCHEMA_VERSION = "2.0"
 PROMPT_VERSION = "meme-semantic-v8-category-reclassification"
@@ -36,9 +35,6 @@ RECLASSIFICATION_STATUSES = frozenset({"", "auto_reclassified", "moved_to_review
 REVIEW_CATEGORY = "needs_review"
 REVIEW_CATEGORY_DESCRIPTION = (
     "自动语义化发现图片与原分类明显不符，等待人工确认或重新移动"
-)
-TASK_STATUSES = frozenset(
-    {"idle", "running", "paused", "completed", "completed_with_errors", "failed"}
 )
 HIDDEN_REASONING_BLOCK_PATTERN = re.compile(
     r"<(?P<tag>think|thinking|analysis|reasoning)\b[^>]*>.*?</(?P=tag)\s*>",
@@ -256,27 +252,6 @@ def normalize_vector(vector: Any) -> list[float]:
     return [value / norm for value in values]
 
 
-def cosine_similarity(left: Iterable[float], right: Iterable[float]) -> float:
-    left_values = list(left)
-    right_values = list(right)
-    if len(left_values) != len(right_values):
-        raise ValueError("向量维度不一致")
-    return sum(a * b for a, b in zip(left_values, right_values))
-
-
-def short_id(content_sha256: str, used_prefixes: Iterable[str] = ()) -> str:
-    """生成 12 位起步、发生碰撞时自动扩展的模型可见 ID。"""
-    digest = str(content_sha256 or "").lower()
-    if len(digest) != 64:
-        raise ValueError("content_sha256 必须是完整 SHA-256")
-    used = {str(item) for item in used_prefixes}
-    for length in (12, 16, 20, 24, 32, 64):
-        prefix = digest[:length]
-        if prefix not in used:
-            return f"meme:{prefix}"
-    return f"meme:{digest}"
-
-
 def build_id_map(digests: Iterable[str]) -> dict[str, str]:
     """为一批完整哈希生成互不歧义的最短前缀。"""
     normalized = sorted({str(digest).lower() for digest in digests})
@@ -303,19 +278,6 @@ def parse_meme_id(value: str) -> str:
     ):
         return ""
     return prefix
-
-
-def extract_and_clean_semantic_meme_references(text: str) -> tuple[str, list[str]]:
-    """Extract semantic markers through the shared context-aware parser.
-
-    Args:
-        text: Complete original response.
-
-    Returns:
-        Visible text and unique semantic references in source order.
-    """
-    result = MemeParser.parse(str(text or ""), semantic=True)
-    return result.text, list(result.selections)
 
 
 def extract_visible_semantic_reply(text: str) -> str:

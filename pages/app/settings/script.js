@@ -11,6 +11,21 @@ async function initSettingsPage() {
   const saveRulesBtn = document.getElementById("save-rules-btn");
   const rulesValidation = document.getElementById("rules-validation");
   const rulesSaveStatus = document.getElementById("rules-save-status");
+  // [patcher:collect-mirror] 收集来源面板（批次 2）
+  const collectSourcesList = document.getElementById("collect-sources-list");
+  const addCollectSourceBtn = document.getElementById("add-collect-source-btn");
+  const reloadCollectSourcesBtn = document.getElementById(
+    "reload-collect-sources-btn",
+  );
+  const saveCollectSourcesBtn = document.getElementById(
+    "save-collect-sources-btn",
+  );
+  const collectSourcesValidation = document.getElementById(
+    "collect-sources-validation",
+  );
+  const collectSourcesStatus = document.getElementById(
+    "collect-sources-status",
+  );
 
   const backupOutputDirInput = document.getElementById(
     "backup-output-dir-input",
@@ -87,6 +102,11 @@ async function initSettingsPage() {
   let pendingPackImportToken = "";
   let exportCapabilityRequestId = 0;
   let packImportBusy = false;
+  // [patcher:collect-mirror] 收集来源（数组形态，键 = group:<群号> / user:<QQ号>）
+  let collectSources = [];
+  let savedCollectSourcesSnapshot = "";
+  let collectSourcesLoaded = false;
+  let collectSourcesBusy = false;
 
   async function apiGet(endpoint, params = {}) {
     return window.AstrBotPluginPage.apiGet(endpoint, params);
@@ -152,6 +172,263 @@ async function initSettingsPage() {
       type,
     );
     rulesSaveStatus.classList.toggle("unsaved", dirty);
+  }
+
+  // ---------- [patcher:collect-mirror] 收集来源面板 ----------
+
+  function collectSourcesDirty() {
+    return (
+      collectSourcesLoaded &&
+      JSON.stringify(collectSources) !== savedCollectSourcesSnapshot
+    );
+  }
+
+  function updateCollectSourcesState(message = "", type = "") {
+    const dirty = collectSourcesDirty();
+    collectSourcesList.inert = collectSourcesBusy;
+    collectSourcesList.setAttribute("aria-busy", String(collectSourcesBusy));
+    addCollectSourceBtn.disabled = collectSourcesBusy || !collectSourcesLoaded;
+    reloadCollectSourcesBtn.disabled = collectSourcesBusy;
+    saveCollectSourcesBtn.disabled =
+      collectSourcesBusy || !collectSourcesLoaded || !dirty;
+    setPackTransferResult(
+      collectSourcesStatus,
+      message ||
+        (dirty
+          ? "有未保存的更改"
+          : collectSourcesLoaded
+          ? "所有更改已保存"
+          : "正在读取设置…"),
+      type,
+    );
+    collectSourcesStatus.classList.toggle("unsaved", dirty);
+  }
+
+  function normalizeCollectSourceKey(value) {
+    const text = String(value || "").trim().replace(/\s+/g, "");
+    if (!text) return "";
+    if (/^(group|user):\S+$/.test(text)) return text;
+    if (/^\d+$/.test(text)) return `group:${text}`;
+    return text;
+  }
+
+  function isValidCollectSourceKey(value) {
+    return /^(group|user):\S+$/.test(normalizeCollectSourceKey(value));
+  }
+
+  function renderCollectSources() {
+    collectSourcesList.replaceChildren();
+    if (!collectSources.length) {
+      const placeholder = document.createElement("p");
+      placeholder.className = "rules-placeholder";
+      placeholder.setAttribute("role", "status");
+      placeholder.textContent =
+        "还没有收集来源。未列出的来源一律不收图；点「新增来源」开始配置。";
+      collectSourcesList.appendChild(placeholder);
+      return;
+    }
+
+    collectSources.forEach((source, index) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "rule-item";
+      wrapper.dataset.index = String(index);
+      wrapper.setAttribute("role", "group");
+      wrapper.setAttribute("aria-label", `第 ${index + 1} 个收集来源`);
+
+      const titleRow = document.createElement("div");
+      titleRow.className = "rule-title-row";
+      const title = document.createElement("div");
+      const titleText = document.createElement("strong");
+      titleText.textContent = source.key || `来源 #${index + 1}`;
+      title.appendChild(titleText);
+      titleRow.appendChild(title);
+      wrapper.appendChild(titleRow);
+
+      const grid = document.createElement("div");
+      grid.className = "rule-grid";
+
+      const keyField = document.createElement("div");
+      keyField.className = "field-row";
+      const keyLabel = document.createElement("label");
+      keyLabel.textContent = "来源";
+      keyLabel.htmlFor = `collect-source-key-${index}`;
+      const keyInput = document.createElement("input");
+      keyInput.type = "text";
+      keyInput.id = `collect-source-key-${index}`;
+      keyInput.dataset.role = "key";
+      keyInput.value = String(source.key || "");
+      keyInput.placeholder = "群号，或 group:123456 / user:10001";
+      keyInput.addEventListener("input", () => {
+        if (!collectSources[index]) return;
+        collectSources[index].key = keyInput.value;
+        updateCollectSourcesState();
+      });
+      keyField.append(keyLabel, keyInput);
+
+      const gateField = document.createElement("div");
+      gateField.className = "field-row";
+      const gateLabel = document.createElement("label");
+      gateLabel.textContent = "收集总闸";
+      gateLabel.htmlFor = `collect-source-gate-${index}`;
+      const gateSelect = document.createElement("select");
+      gateSelect.id = `collect-source-gate-${index}`;
+      gateSelect.dataset.role = "enabled";
+      gateSelect.innerHTML =
+        '<option value="on">开启收集</option><option value="off">关闭收集</option>';
+      gateSelect.value = source.enabled ? "on" : "off";
+      gateSelect.addEventListener("change", () => {
+        if (!collectSources[index]) return;
+        collectSources[index].enabled = gateSelect.value === "on";
+        updateCollectSourcesState();
+      });
+      gateField.append(gateLabel, gateSelect);
+
+      const packField = document.createElement("div");
+      packField.className = "field-row";
+      const packLabel = document.createElement("label");
+      packLabel.textContent = "镜像目标图库";
+      packLabel.htmlFor = `collect-source-packs-${index}`;
+      const packSelect = document.createElement("select");
+      packSelect.id = `collect-source-packs-${index}`;
+      packSelect.dataset.role = "packs";
+      packSelect.multiple = true;
+      packSelect.size = 4;
+      packSelect.title = "可多选：按住 Ctrl / ⌘ 点选，或直接点选多行";
+      appendPackOptions(packSelect, source.packs || []);
+      packSelect.addEventListener("change", () => {
+        if (!collectSources[index]) return;
+        collectSources[index].packs = Array.from(packSelect.selectedOptions)
+          .map((option) => option.value)
+          .filter(Boolean);
+        updateCollectSourcesState();
+      });
+      packField.append(packLabel, packSelect);
+
+      grid.append(keyField, gateField, packField);
+      wrapper.appendChild(grid);
+
+      const actions = document.createElement("div");
+      actions.className = "rule-actions";
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "danger compact-btn";
+      removeBtn.dataset.action = "remove";
+      removeBtn.setAttribute("aria-label", `删除第 ${index + 1} 个收集来源`);
+      removeBtn.textContent = "删除来源";
+      removeBtn.addEventListener("click", () => {
+        collectSources.splice(index, 1);
+        renderCollectSources();
+        updateCollectSourcesState();
+      });
+      actions.appendChild(removeBtn);
+      wrapper.appendChild(actions);
+
+      collectSourcesList.appendChild(wrapper);
+    });
+  }
+
+  function buildCollectSourcesPayload() {
+    const seen = new Set();
+    const duplicates = [];
+    const payload = {};
+    for (const source of collectSources) {
+      const key = normalizeCollectSourceKey(source.key);
+      if (!key || !isValidCollectSourceKey(key)) continue;
+      if (seen.has(key)) {
+        duplicates.push(key);
+        continue;
+      }
+      seen.add(key);
+      payload[key] = {
+        enabled: Boolean(source.enabled),
+        packs: (source.packs || []).map((item) => String(item)).filter(Boolean),
+      };
+    }
+    return { payload, duplicates };
+  }
+
+  async function loadCollectSources() {
+    collectSourcesBusy = true;
+    updateCollectSourcesState("正在加载收集来源…");
+    setLoading(reloadCollectSourcesBtn, "加载中...");
+    let error = "";
+    try {
+      const response = await apiGet("settings/collect_sources");
+      const sources = response?.sources || {};
+      collectSources = Object.entries(sources).map(([key, entry]) => ({
+        key,
+        enabled: Boolean(entry?.enabled),
+        packs: Array.isArray(entry?.packs) ? [...entry.packs] : [],
+      }));
+      savedCollectSourcesSnapshot = JSON.stringify(collectSources);
+      collectSourcesLoaded = true;
+      renderCollectSources();
+    } catch (err) {
+      error = `加载失败：${err?.message || String(err)}。请点「重新加载」重试。`;
+      addLog(`加载收集来源失败: ${err?.message || String(err)}`, true);
+      collectSourcesList.replaceChildren();
+      const placeholder = document.createElement("p");
+      placeholder.className = "rules-placeholder";
+      placeholder.textContent =
+        "暂时无法读取收集来源配置。你的已保存设置未受影响。";
+      collectSourcesList.appendChild(placeholder);
+    } finally {
+      collectSourcesBusy = false;
+      clearLoading(reloadCollectSourcesBtn);
+      updateCollectSourcesState(error || "", error ? "error" : "");
+    }
+  }
+
+  async function saveCollectSources() {
+    if (collectSourcesBusy) return;
+    const { payload, duplicates } = buildCollectSourcesPayload();
+    const invalid = collectSources.filter(
+      (source) =>
+        String(source.key || "").trim() &&
+        !isValidCollectSourceKey(source.key),
+    );
+    let problem = "";
+    if (duplicates.length) {
+      problem = `来源重复：${duplicates.join("、")}。请合并或改名后再保存。`;
+    } else if (invalid.length) {
+      problem =
+        "来源格式无效：请填纯群号，或 group:<群号> / user:<QQ号> 形式。";
+    }
+    if (problem) {
+      updateCollectSourcesState(problem, "error");
+      collectSourcesValidation.classList.remove("hidden");
+      collectSourcesValidation.textContent = problem;
+      collectSourcesValidation.focus();
+      return;
+    }
+    collectSourcesValidation.classList.add("hidden");
+    collectSourcesValidation.textContent = "";
+
+    collectSourcesBusy = true;
+    updateCollectSourcesState("正在保存收集来源…");
+    setLoading(saveCollectSourcesBtn, "保存中...");
+    let error = "";
+    try {
+      await apiPost("settings/collect_sources", { sources: payload });
+      collectSources = Object.entries(payload).map(([key, entry]) => ({
+        key,
+        enabled: Boolean(entry.enabled),
+        packs: [...entry.packs],
+      }));
+      savedCollectSourcesSnapshot = JSON.stringify(collectSources);
+      renderCollectSources();
+      addLog("收集来源已保存");
+    } catch (err) {
+      error = `保存失败：${err?.message || String(err)}。请重试。`;
+      addLog(`保存收集来源失败: ${err?.message || String(err)}`, true);
+    } finally {
+      collectSourcesBusy = false;
+      clearLoading(saveCollectSourcesBtn);
+      updateCollectSourcesState(
+        error || "收集来源已保存",
+        error ? "error" : "success",
+      );
+    }
   }
 
   function selectedExportMode() {
@@ -574,15 +851,26 @@ async function initSettingsPage() {
     return rules.findIndex((rule) => rule.scope === "default");
   }
 
-  function appendPackOptions(select, selectedPackId = "") {
-    if (
-      !installedPacks.some((pack) => String(pack.id) === String(selectedPackId))
-    ) {
+  function normalizePackIds(rule) {
+    const ids = Array.isArray(rule?.pack_ids)
+      ? rule.pack_ids.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    if (ids.length) return ids;
+    const single = String(rule?.pack_id || "").trim();
+    return single ? [single] : [];
+  }
+
+  function appendPackOptions(select, selectedPackIds = []) {
+    const selected = (
+      Array.isArray(selectedPackIds) ? selectedPackIds : [selectedPackIds]
+    )
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
+    for (const packId of selected) {
+      if (installedPacks.some((pack) => String(pack.id) === packId)) continue;
       const missingOption = document.createElement("option");
-      missingOption.value = String(selectedPackId || "");
-      missingOption.textContent = selectedPackId
-        ? `表情包不存在（${selectedPackId}）`
-        : "请选择表情包";
+      missingOption.value = packId;
+      missingOption.textContent = `表情包不存在（${packId}）`;
       missingOption.selected = true;
       select.appendChild(missingOption);
     }
@@ -590,7 +878,7 @@ async function initSettingsPage() {
       const packId = String(pack.id || "");
       const option = document.createElement("option");
       option.value = packId;
-      option.selected = packId === String(selectedPackId);
+      option.selected = selected.includes(packId);
       option.textContent = `${pack.name || packId} (${packId})`;
       select.appendChild(option);
     }
@@ -622,6 +910,11 @@ async function initSettingsPage() {
       return;
     }
     rules[index][key] = value;
+    if (key === "pack_ids") {
+      const picked = Array.isArray(value) ? value : [];
+      rules[index].pack_ids = picked;
+      rules[index].pack_id = picked[0] || "";
+    }
     renderRulesValidation();
     updateRulesState();
   }
@@ -859,7 +1152,10 @@ async function initSettingsPage() {
       const packSelectElement = document.createElement("select");
       packSelectElement.dataset.role = "pack";
       packSelectElement.id = `rule-pack-${index}`;
-      appendPackOptions(packSelectElement, rule.pack_id);
+      packSelectElement.multiple = true;
+      packSelectElement.size = 4;
+      packSelectElement.title = "可多选：按住 Ctrl / ⌘ 点选，或直接点选多行";
+      appendPackOptions(packSelectElement, normalizePackIds(rule));
       packField.append(packLabel, packSelectElement);
 
       grid.appendChild(scopeField);
@@ -919,7 +1215,10 @@ async function initSettingsPage() {
       });
 
       packSelect.addEventListener("change", () => {
-        updateRuleFromInput(index, "pack_id", packSelect.value);
+        const picked = Array.from(packSelect.selectedOptions)
+          .map((option) => option.value)
+          .filter(Boolean);
+        updateRuleFromInput(index, "pack_ids", picked);
       });
 
       actions
@@ -1021,15 +1320,26 @@ async function initSettingsPage() {
     renderRules();
     const nextTransferPackId = syncTransferPackOptions(preferredTransferPackId);
     await refreshPackExportCapability(nextTransferPackId);
+    await loadCollectSources();
+  }
+
+  function currentDefaultPackId() {
+    const defaultRule = rules.find(
+      (rule) => String(rule.scope || "").trim() === "default",
+    );
+    return String(defaultRule?.pack_id || "").trim();
   }
 
   function buildNewRule(scope) {
     const firstSuggestion = getTargetSuggestions(scope)[0] || "";
+    // Q22：新建规则时「使用表情包」默认预填 = 默认图库。
+    const presetPackId = currentDefaultPackId() || installedPacks[0]?.id || "";
     return {
       id: `${scope}-${Date.now()}`,
       scope,
       target: firstSuggestion,
-      pack_id: installedPacks[0]?.id || "",
+      pack_id: presetPackId,
+      pack_ids: presetPackId ? [presetPackId] : [],
     };
   }
 
@@ -1041,10 +1351,13 @@ async function initSettingsPage() {
       return;
     }
     const payloadRules = rules.map((rule) => {
+      // 保留多包绑定：pack_id 只存首个（兼容旧读法），完整集合在 pack_ids。
+      const packIds = normalizePackIds(rule);
       const normalized = {
         id: String(rule.id || "").trim(),
         scope: String(rule.scope || "").trim(),
-        pack_id: String(rule.pack_id || "").trim(),
+        pack_id: packIds[0] || String(rule.pack_id || "").trim(),
+        pack_ids: packIds,
       };
       if (normalized.scope !== "default") {
         normalized.target = String(rule.target || "").trim();
@@ -1263,6 +1576,40 @@ async function initSettingsPage() {
     void saveRules();
   });
 
+  addCollectSourceBtn.addEventListener("click", () => {
+    // Q20/Q22：新建来源默认「开启 + 默认图库」，与面板其余新建项一致。
+    const presetPackId = currentDefaultPackId() || installedPacks[0]?.id || "";
+    collectSources.push({
+      key: "",
+      enabled: true,
+      packs: presetPackId ? [presetPackId] : [],
+    });
+    renderCollectSources();
+    updateCollectSourcesState();
+    collectSourcesList.lastElementChild
+      ?.querySelector('input[data-role="key"]')
+      ?.focus();
+  });
+
+  reloadCollectSourcesBtn.addEventListener("click", async () => {
+    if (collectSourcesBusy) return;
+    if (collectSourcesDirty()) {
+      const confirmed = await window.MemeUI.confirm({
+        title: "重新加载收集来源",
+        message:
+          "当前有未保存的更改。重新加载会丢弃这些更改，恢复到上次保存的配置。",
+        confirmText: "丢弃并重新加载",
+        danger: true,
+      });
+      if (!confirmed) return;
+    }
+    await loadCollectSources();
+  });
+
+  saveCollectSourcesBtn.addEventListener("click", () => {
+    void saveCollectSources();
+  });
+
   exportBackupBtn.addEventListener("click", () => {
     void exportBackup();
   });
@@ -1334,6 +1681,7 @@ async function initSettingsPage() {
         window.MemeSettings?.busy ||
         Boolean(saveRulesBtn.dataset.originalHtml) ||
         Boolean(importBackupBtn.dataset.originalHtml) ||
+        collectSourcesDirty() ||
         (rulesLoaded && JSON.stringify(rules) !== savedRulesSnapshot))
     ) {
       event.preventDefault();
@@ -1366,7 +1714,8 @@ async function initSettingsPage() {
         return;
       const rulesDirty =
         rulesLoaded && JSON.stringify(rules) !== savedRulesSnapshot;
-      if (!rulesDirty && !window.MemeSettings?.dirty) return;
+      if (!rulesDirty && !collectSourcesDirty() && !window.MemeSettings?.dirty)
+        return;
       event.preventDefault();
       event.stopImmediatePropagation();
       if (window.MemeSettings?.busy) {

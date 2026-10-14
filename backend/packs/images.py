@@ -8,7 +8,7 @@ from werkzeug.utils import secure_filename
 
 from astrbot.api import logger
 
-from .categories import is_safe_category_name
+from .categories import resolve_safe_category_directory
 from .resolver import resolve_pack_context
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
@@ -45,7 +45,7 @@ def _is_supported_image(filename: str) -> bool:
 
 
 def _get_category_path(category: str) -> Path:
-    """解析分类目录，并禁止目录穿越。
+    """解析分类目录，并禁止目录穿越（委托 categories.resolve_safe_category_directory）。
 
     Args:
         category: 只能包含单个目录段的分类名称。
@@ -56,17 +56,10 @@ def _get_category_path(category: str) -> Path:
     Raises:
         ValueError: 分类名称非法或解析后的路径超出表情目录。
     """
-    normalized = str(category or "").strip()
-    if not is_safe_category_name(normalized):
-        raise ValueError("分类名称非法")
-
-    memes_root = _get_memes_root()
-    category_path = (memes_root / normalized).resolve()
-    try:
-        category_path.relative_to(memes_root)
-    except ValueError as exc:
-        raise ValueError("分类路径超出表情目录") from exc
-    return category_path
+    # [patcher:orphan-cleanup] 收敛到单一安全实现，避免两套目录穿越校验
+    return resolve_safe_category_directory(
+        _get_memes_root(), str(category or "").strip()
+    )
 
 
 def _iter_category_image_paths(category_path: Path) -> list[Path]:
@@ -510,21 +503,3 @@ def clear_all_emojis() -> dict[str, object]:
             deleted_by_category[category_path.name] = len(deleted_files)
 
     return {"deleted_by_category": deleted_by_category}
-
-
-def update_emoji_in_category(category, old_image_file, new_image_file):
-    """更新（替换）表情包文件"""
-    category_path = _get_category_path(category)
-
-    if not category_path.is_dir():
-        return False
-    old_image_name = Path(str(old_image_file or "")).name
-    old_image_path = category_path / old_image_name
-    if old_image_path.is_file() and _is_supported_image(old_image_name):
-        filename = secure_filename(str(new_image_file.filename or ""))
-        if not filename or not _is_supported_image(filename):
-            raise ValueError("表情文件名或扩展名非法")
-        old_image_path.unlink()
-        new_image_file.save(str(category_path / filename))
-        return True
-    return False

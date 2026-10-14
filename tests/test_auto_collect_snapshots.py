@@ -10,6 +10,18 @@ from unittest.mock import AsyncMock, patch
 from astrbot_plugin_meme_manager.backend import auto_collect
 
 
+def _close_image_index():
+    """释放模块级图片索引缓存的 sqlite 连接，避免 Windows 临时目录清理时 WinError 32。"""
+    packs = getattr(auto_collect._IMAGE_INDEX, "_packs", None)
+    if isinstance(packs, dict):
+        for connection in list(packs.values()):
+            try:
+                connection.close()
+            except Exception:
+                pass
+        packs.clear()
+
+
 class SnapshotLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -25,6 +37,16 @@ class SnapshotLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
         self.source = self.root / "source.png"
         self.source.write_bytes(b"snapshot-content")
+        self.packs = self.root / "packs"
+        (self.packs / "pack-a" / "memes" / "happy").mkdir(parents=True)
+        self.stack.enter_context(patch.object(auto_collect, "PACKS_DIR", self.packs))
+        self.stack.enter_context(
+            patch.object(
+                auto_collect,
+                "load_pack_category_mapping",
+                return_value={"happy": "happy"},
+            )
+        )
         plugin = SimpleNamespace(
             _resolve_runtime_pack_context=lambda **_: {
                 "pack_id": "pack-a",
@@ -36,6 +58,15 @@ class SnapshotLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.manager._ready = True
         self.addAsyncCleanup(self.manager.close)
+        self.addCleanup(_close_image_index)
+        # 显式白名单（Q15/Q19）：本用例的来源需被 collect_sources 认可才允许收图。
+        self.stack.enter_context(
+            patch.object(
+                auto_collect.collect_sources,
+                "resolve_packs",
+                side_effect=lambda key: ["pack-a"] if key else [],
+            )
+        )
         self.image = auto_collect.Image(file="https://example.com/image.png")
         self.event = SimpleNamespace(
             is_private_chat=lambda: False,
@@ -95,10 +126,10 @@ class SnapshotLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             results = await asyncio.gather(
                 self.manager._snapshot_and_enqueue(
-                    self.image, "pack-a", {}, "group", "a"
+                    self.image, ["pack-a"], "pack-a", {}, "group", "a"
                 ),
                 self.manager._snapshot_and_enqueue(
-                    self.image, "pack-a", {}, "group", "b"
+                    self.image, ["pack-a"], "pack-a", {}, "group", "b"
                 ),
             )
         self.assertEqual(sorted(results), [False, True])
@@ -129,7 +160,7 @@ class SnapshotLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             task = asyncio.create_task(
                 self.manager._snapshot_and_enqueue(
-                    self.image, "pack-a", {}, "group", "a"
+                    self.image, ["pack-a"], "pack-a", {}, "group", "a"
                 )
             )
             self.assertTrue(await asyncio.to_thread(started.wait, 2))

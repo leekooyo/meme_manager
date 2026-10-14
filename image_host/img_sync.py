@@ -174,10 +174,6 @@ class ImageSync:
         self.upload_tracker.load()
         return process.exitcode == 0
 
-    def get_remote_files(self) -> list[dict]:
-        """Return the complete remote image inventory."""
-        return self.provider.get_image_list()
-
     def delete_remote_file(self, image_id: str) -> bool:
         """Delete an opaque remote ID when no sync worker is running.
 

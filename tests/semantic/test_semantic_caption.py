@@ -55,7 +55,7 @@ def test_prepare_visual_inputs_keeps_static_image(tmp_path):
     assert temp_paths == []
 
 
-def test_prepare_visual_inputs_samples_animated_gif_and_legacy_wrapper(tmp_path):
+def test_prepare_visual_inputs_samples_animated_gif(tmp_path):
     gif_path = tmp_path / "animated.gif"
     frames = [Image.new("RGB", (2, 2), color) for color in ("red", "green", "blue")]
     frames[0].save(
@@ -67,19 +67,13 @@ def test_prepare_visual_inputs_samples_animated_gif_and_legacy_wrapper(tmp_path)
     )
     visual_paths, temp_paths = caption.prepare_visual_inputs(gif_path)
     try:
-        assert len(visual_paths) == 3
+        # [patcher:orphan-cleanup] MAX_GIF_FRAMES 已被 [patcher:vision-cheap] 降为 2
+        assert len(visual_paths) == min(3, caption.MAX_GIF_FRAMES)
         assert visual_paths == temp_paths
         assert all(Path(path).is_file() for path in temp_paths)
     finally:
         for path in temp_paths:
             Path(path).unlink(missing_ok=True)
-
-    first_path, temporary_path = caption.prepare_visual_input(gif_path)
-    try:
-        assert first_path == temporary_path
-        assert Path(first_path).is_file()
-    finally:
-        Path(first_path).unlink(missing_ok=True)
 
 
 def test_prepare_visual_inputs_handles_unknown_static_and_broken_animation(tmp_path):

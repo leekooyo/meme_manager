@@ -26,7 +26,7 @@ from astrbot.core.platform.sources.webchat.webchat_queue_mgr import webchat_queu
 
 
 @pytest.fixture
-def reply_context(tmp_path):
+def reply_context(tmp_path, monkeypatch):
     mapping = {"happy": "开心", "sad": "难过", "angry": "生气"}
     for tag in mapping:
         directory = tmp_path / tag
@@ -52,10 +52,29 @@ def reply_context(tmp_path):
     sender.content_cleanup_rule = r"&&[a-zA-Z]*&&"
     sender._semantic_mode_active = lambda event: False
     sender._resolve_runtime_pack_context = lambda **kwargs: {
-        "category_mapping": mapping,
+        "pack_id": "default",
+        "pack_ids": ["default"],
         "pack_dir": tmp_path,
+        "memes_dir": tmp_path,
+        "metadata_path": tmp_path / "metadata.json",
+        "manifest_path": tmp_path / "manifest.json",
+        "category_mapping": mapping,
     }
     sender._get_runtime_memes_dir_for_event = lambda event: tmp_path
+    sender._get_runtime_pack_ids_for_event = lambda event=None: ["default"]
+    from astrbot_plugin_meme_manager.backend.packs import resolver as _pack_resolver
+
+    monkeypatch.setattr(
+        _pack_resolver,
+        "get_pack_paths",
+        lambda pack_id: {
+            "pack_id": str(pack_id),
+            "pack_dir": tmp_path,
+            "memes_dir": tmp_path,
+            "metadata_path": tmp_path / "metadata.json",
+            "manifest_path": tmp_path / "manifest.json",
+        },
+    )
     sender._send_meme_image = AsyncMock()
     state = {LLM_REQUEST_ORIGIN_EXTRA_KEY: "chat"}
     event = SimpleNamespace(

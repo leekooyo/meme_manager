@@ -337,14 +337,6 @@ def prepare_visual_inputs(path: Path | str) -> tuple[list[str], list[str]]:
         raise ValueError(f"动图多帧处理失败：{exc}") from exc
 
 
-def prepare_visual_input(path: Path | str) -> tuple[str, str | None]:
-    """保留旧调用接口；新代码应使用 prepare_visual_inputs。"""
-    visual_paths, temp_paths = prepare_visual_inputs(path)
-    for extra_path in temp_paths[1:]:
-        Path(extra_path).unlink(missing_ok=True)
-    return visual_paths[0], temp_paths[0] if temp_paths else None
-
-
 def _read_usage_number(usage: Any, *names: str) -> int:
     """兼容 AstrBot TokenUsage 和不同模型返回的 usage 字段。"""
     if usage is None:

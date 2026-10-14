@@ -1,9 +1,19 @@
+import json
 from pathlib import Path
 
 PACK_TRANSFER_FORMAT = "astrbot-meme-pack"
 PACK_TRANSFER_VERSION = 2
 PACK_TRANSFER_MANIFEST = "meme_pack_export.json"
 PACK_EXPORT_MODES = {"share", "backup"}
+
+
+def load_json_file(path, default=None, *, encoding: str = "utf-8-sig"):
+    """[patcher:orphan-cleanup] 统一的容错 JSON 读取（BOM 兼容，异常回退默认值）。"""
+    try:
+        with Path(path).open(encoding=encoding) as file_obj:
+            return json.load(file_obj)
+    except Exception:
+        return default
 
 
 def _require_str(payload: dict, key: str, context: str) -> str:

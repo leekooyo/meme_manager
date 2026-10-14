@@ -51,6 +51,9 @@
               hidden
             ></span>
           </button>
+          <button type="button" data-settings-tab="collect-sources">
+            <i class="fas fa-clone" aria-hidden="true"></i>收集来源
+          </button>
           <button type="button" data-settings-tab="storage">
             <i class="fas fa-cloud" aria-hidden="true"></i>存储与下载<span
               class="settings-dirty-dot"
@@ -109,6 +112,52 @@
             </p>
             <button id="save-rules-btn" disabled>
               <i class="fas fa-floppy-disk icon"></i>保存规则
+            </button>
+          </div>
+        </section>
+
+        <!-- [patcher:collect-mirror] 按来源配置自动收集的镜像目标图库（批次 2） -->
+        <section class="panel rules-panel" data-settings-panel="collect-sources" hidden>
+          <div class="panel-head">
+            <h2><i class="fas fa-clone icon"></i>收集来源与镜像目标</h2>
+            <div class="head-actions">
+              <button id="add-collect-source-btn" class="secondary">新增来源</button>
+              <button id="reload-collect-sources-btn" class="ghost">重新加载</button>
+            </div>
+          </div>
+
+          <p class="hint">
+            按<strong>来源</strong>配置自动收集：只有列在这里、且「总闸」为开启的来源才会收图，
+            <strong>未列出的来源一律不收</strong>。收进来的表情包会<strong>复制镜像</strong>进你勾选的每一个图库
+            （视觉识别只跑一次，其余图库按分类名落位）。
+          </p>
+
+          <div
+            id="collect-sources-validation"
+            class="validation hidden"
+            role="alert"
+            tabindex="-1"
+          ></div>
+
+          <div
+            id="collect-sources-list"
+            class="rules-list"
+            aria-label="收集来源"
+          >
+            <p class="rules-placeholder" role="status">正在加载收集来源…</p>
+          </div>
+
+          <div class="save-row">
+            <p
+              id="collect-sources-status"
+              class="result"
+              role="status"
+              aria-live="polite"
+            >
+              正在读取设置…
+            </p>
+            <button id="save-collect-sources-btn" disabled>
+              <i class="fas fa-floppy-disk icon"></i>保存收集来源
             </button>
           </div>
         </section>

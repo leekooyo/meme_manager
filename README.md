@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen)](DEVELOPMENT.md)
 [![Contributors](https://img.shields.io/github/contributors/anka-afk/astrbot_plugin_meme_manager?color=green)](https://github.com/anka-afk/astrbot_plugin_meme_manager/graphs/contributors)
-[![Last Commit](https://img.shields.io/github/last-commit/anka-afk/astrbot_plugin_meme_manager)](https://github.com/anka-afk/astrbot_plugin_meme_manager/commits/main)
+[![Last Commit](https://img.shields.io/github/last-commit/leekooyo/meme_manager)](https://github.com/leekooyo/meme_manager/commits/main)
 
 </div>
 
@@ -20,6 +20,14 @@
 </div>
 
 一个功能强大的 AstrBot 表情包管理插件，支持 🤖 AI 智能发送与自动收集表情、🖥️ WebUI 管理界面、☁️ 云端同步等特性。
+
+## 安装此维护版
+
+在 AstrBot 中选择「通过仓库地址安装」，填写 `https://github.com/leekooyo/meme_manager`。本仓库基于 [anka-afk 原项目](https://github.com/anka-afk/astrbot_plugin_meme_manager) 独立维护；原始代码基线、历史记录说明与本地改动见 [UPSTREAM.md](UPSTREAM.md)。插件更新从本仓库获取，原项目新版本需要人工审查后合并。
+
+表情包、图片、运行日志、云存储密钥和 AstrBot 实际配置都保存在部署环境，不应提交到 GitHub。自动收集默认关闭且默认需要人工审核；启用并配置来源白名单后，可能把获准来源的图片发给视觉模型。普通图片也会按重复次数抽样；若只想处理 QQ 明确标记的表情，开启 `auto_collect.only_marked_images`。云端同步需单独配置存储服务。社区包下载默认使用 `https://ghfast.top/` 加速，若不信任该第三方服务，可在设置中心将 GitHub 加速地址清空，改为直连。
+
+另外，`generation.llm_free_random` 是独立的随机发图通道，默认开启，发图概率为 `3%`；其中「模型选分类」也默认开启，默认每日模型调用上限 `0` 表示不限制。若不需要主动发图或不希望为选分类调用模型，请分别关闭 `enabled` 或 `api_enabled`，并按需设置 `api_daily_limit`。这些选项与“自动收集”是不同功能。
 
 ## 📑 目录
 
@@ -120,7 +128,7 @@
 
 ## 🤖 自动收集表情包
 
-在**设置中心 → 自动收集**开启，并选择支持图片输入的视觉模型。插件会识别收到的图片，从目标表情包的现有分类中选择合适的分类，并进行去重。
+在**设置中心 → 自动收集**开启，选择支持图片输入的视觉模型，并在收集来源面板明确添加群聊或个人来源及目标图库。当前版本使用来源白名单：未添加的来源不会收图，留空不代表全部来源。旧版 `scope` 和 `target_pack_id` 只在首次迁移且尚无来源文件时使用。插件会识别收到的图片，从目标表情包的现有分类中选择合适的分类，并进行去重。
 
 平台明确标记为表情的图片直接进入抽样与识别流程；普通图片或缺少平台分类的图片首次仅记录，第二次出现时有 45% 的识别采样概率，之后逐次提高，第八次必定触发。同一发送者在不同消息中重复发送也会计数；连续 7 天未出现的记录会过期。单条消息最多处理的图片数可设置为 1–10 张，默认 1 张；同一来源最短识别间隔限制的是不同消息的入队时间，不影响重复次数记录。
 
@@ -159,6 +167,11 @@
 | `/表情管理 从云端同步`                 | ⬇️ 从云端同步表情到本地                             |
 | `/表情管理 覆盖到云端`                 | ⚠️ 让云端与本地完全一致                             |
 | `/表情管理 从云端覆盖`                 | ⚠️ 让本地与云端完全一致                             |
+| `/表情管理 图库统计`                   | 查看图库数量与分类统计                              |
+| `/表情管理 参数 [参数名]`             | 管理员查看配置参数                                  |
+| `/表情管理 设置 <参数名> <值>`        | 管理员修改配置参数                                  |
+| `/表情管理 清理超额 [--dry]`          | 管理员清理超过容量的图片；可先预览                   |
+| `/表情包`                             | 普通用户查看可用表情包入口                          |
 
 ## 📜 更新日志
 
@@ -177,18 +190,3 @@
 ## 📄 许可证
 
 本项目基于 MIT 许可证开源。
-
-
-### 补充指令（2026-10-12）
-
-以下命令已正式注册，私聊也可用：
-
-| 格式 | 权限 |
-| --- | --- |
-| `/表情管理 图库统计` | 普通用户 |
-| `/表情管理 参数 [参数名]` | 管理员 |
-| `/表情管理 设置 <参数名> <值>` | 管理员 |
-| `/表情管理 清理超额 [--dry]` | 管理员 |
-| `/表情包` | 普通用户 |
-
-查看分类请用 `/表情管理 查看图库`。

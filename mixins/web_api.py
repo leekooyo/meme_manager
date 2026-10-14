@@ -455,6 +455,13 @@ class WebAPIMixin:
             ["GET"],
             "获取规则 target 建议值",
         )
+        # [patcher:collect-mirror] 自动收集来源（按来源的镜像目标图库）
+        self._register_webui_api(
+            "settings/collect_sources",
+            self._api_settings_collect_sources,
+            ["GET", "POST"],
+            "获取或保存自动收集来源配置",
+        )
         self._register_webui_api(
             "settings/backup/export",
             self._api_export_runtime_backup,
@@ -790,15 +797,6 @@ class WebAPIMixin:
                     path.unlink()
             except OSError:
                 continue
-
-    def _guard_default_pack_file_operation(self, operation: str):
-        pack_id = str(self._resolve_runtime_pack_context().get("pack_id") or "").strip()
-        try:
-            if pack_id:
-                self._semantic_operation_guard(pack_id, operation)
-        except RuntimeError as exc:
-            return jsonify({"message": str(exc)}), 409
-        return None
 
     async def _run_default_pack_mutation(self, operation: str, mutation):
         """让分类/移动操作与同图包语义任务共享同一把锁。"""
@@ -3596,6 +3594,47 @@ class WebAPIMixin:
         except Exception as e:
             logger.error(f"保存规则失败: {e}", exc_info=True)
             return jsonify({"message": f"保存规则失败: {str(e)}"}), 500
+
+    async def _api_settings_collect_sources(self):
+        """按来源读写自动收集配置（`collect_sources.json`）。
+
+        GET 返回 ``{sources, default_packs}``；POST 接收 ``{sources}``（整表覆盖）。
+        """
+        from ..backend import collect_sources
+
+        if request.method == "GET":
+            try:
+                return jsonify(
+                    {
+                        "sources": collect_sources.list_sources(),
+                        "default_packs": collect_sources.default_packs(),
+                    }
+                ), 200
+            except Exception as e:
+                logger.error(f"获取收集来源失败: {e}", exc_info=True)
+                return jsonify({"message": f"获取收集来源失败: {str(e)}"}), 500
+
+        try:
+            data = await request.get_json()
+            sources = (data or {}).get("sources", {})
+            if not isinstance(sources, dict):
+                raise ValueError("sources 必须是「来源 → 配置」的对象")
+            for key, entry in sources.items():
+                if not str(key or "").strip() or ":" not in str(key):
+                    raise ValueError(
+                        f"来源键必须形如 group:<群号> / user:<QQ号>，收到：{key}"
+                    )
+                if not isinstance(entry, dict):
+                    raise ValueError(f"来源 {key} 的配置必须是对象")
+            saved = collect_sources.save(
+                {"schema_version": collect_sources.SCHEMA_VERSION, "sources": sources}
+            )
+            return jsonify({"message": "收集来源保存成功", **saved}), 200
+        except ValueError as e:
+            return jsonify({"message": str(e)}), 400
+        except Exception as e:
+            logger.error(f"保存收集来源失败: {e}", exc_info=True)
+            return jsonify({"message": f"保存收集来源失败: {str(e)}"}), 500
 
     async def _api_export_runtime_backup(self):
         try:

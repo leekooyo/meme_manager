@@ -6,7 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from astrbot_plugin_meme_manager.backend import auto_collect
+from astrbot_plugin_meme_manager.backend import auto_collect, collect_sources
+from astrbot_plugin_meme_manager.backend.semantic import caption as caption_module
 from astrbot_plugin_meme_manager.backend.semantic.caption import prepare_visual_inputs
 from PIL import Image as PILImage
 
@@ -135,7 +136,10 @@ class AutoCollectImageTests(unittest.TestCase):
             )
             visual_paths, temporary_paths = prepare_visual_inputs(source)
             try:
-                self.assertEqual(len(visual_paths), 3)
+                # 抽帧数量受 MAX_GIF_FRAMES 限制（本机 [patcher:vision-cheap] 降为 2）。
+                self.assertEqual(
+                    len(visual_paths), min(3, caption_module.MAX_GIF_FRAMES)
+                )
                 self.assertEqual(visual_paths, temporary_paths)
                 self.assertTrue(
                     all(Path(path).suffix == ".png" for path in visual_paths)
@@ -146,11 +150,28 @@ class AutoCollectImageTests(unittest.TestCase):
 
 
 class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_scope_accepts_prefixed_group_and_user_ids(self):
+    async def test_collect_whitelist_gates_prefixed_group_and_user_ids(self):
+        """[patcher:collect-mirror] 收集白名单改由 collect_sources.json 决定。"""
         with tempfile.TemporaryDirectory() as temp_dir:
+            sources_path = Path(temp_dir) / "collect_sources.json"
+            sources_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "sources": {
+                            "group:100": {"enabled": True, "packs": ["pack-a"]},
+                            "user:200": {"enabled": True, "packs": ["pack-a"]},
+                            "group:300": {"enabled": False, "packs": ["pack-a"]},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             with patch.object(
                 auto_collect, "AUTO_COLLECT_STATE_PATH", Path(temp_dir) / "state.json"
-            ):
+            ), patch.object(
+                collect_sources, "COLLECT_SOURCES_PATH", sources_path
+            ), patch.object(collect_sources, "_pack_exists", lambda _pack_id: True):
                 manager = auto_collect.AutoCollectManager(
                     DummyPlugin(),
                     {
@@ -160,15 +181,40 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
-            self.assertTrue(manager._source_allowed(DummyEvent("100"))[0])
-            self.assertTrue(manager._source_allowed(DummyEvent("200", private=True))[0])
-            self.assertFalse(manager._source_allowed(DummyEvent("300"))[0])
+                allowed, kind, source_id, packs = manager._resolve_collect_targets(
+                    DummyEvent("100")
+                )
+                self.assertTrue(allowed)
+                self.assertEqual((kind, source_id, packs), ("group", "100", ["pack-a"]))
+
+                allowed, kind, source_id, packs = manager._resolve_collect_targets(
+                    DummyEvent("200", private=True)
+                )
+                self.assertTrue(allowed)
+                self.assertEqual((kind, source_id, packs), ("user", "200", ["pack-a"]))
+
+            # 白名单外（未列出）
+            self.assertFalse(manager._resolve_collect_targets(DummyEvent("400"))[0])
+            # 在白名单内但总闸关闭
+            self.assertFalse(manager._resolve_collect_targets(DummyEvent("300"))[0])
 
     async def test_submit_prioritizes_marked_images_and_observes_others(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             packs_dir = root / "packs"
             (packs_dir / "pack-a" / "memes" / "happy").mkdir(parents=True)
+            sources_path = root / "collect_sources.json"
+            sources_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "sources": {
+                            "group:100": {"enabled": True, "packs": ["pack-a"]}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             regular = root / "regular.png"
             meme = root / "meme.png"
             regular.write_bytes(png_bytes())
@@ -192,6 +238,11 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                     "load_pack_category_mapping",
                     return_value={"happy": "positive reaction"},
                 ),
+                patch.object(collect_sources, "COLLECT_SOURCES_PATH", sources_path),
+                patch.object(
+                    collect_sources, "_pack_exists", lambda _pack_id: True
+                ),
+                patch.object(collect_sources, "default_packs", lambda: ["pack-a"]),
                 patch.object(auto_collect.random, "random", return_value=1.0),
             ):
                 for name, raw_image_data, expected in cases:
@@ -201,7 +252,6 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "enabled": True,
                                 "vision_provider_id": "vision",
-                                "target_pack_id": "pack-a",
                                 "cooldown_seconds": 0,
                             },
                         )
@@ -221,6 +271,18 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temp_dir)
             packs_dir = root / "packs"
             (packs_dir / "pack-a" / "memes" / "happy").mkdir(parents=True)
+            sources_path = root / "collect_sources.json"
+            sources_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "sources": {
+                            "group:100": {"enabled": True, "packs": ["pack-a"]}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             regular = root / "regular.png"
             meme = root / "meme.png"
             another_meme = root / "another-meme.png"
@@ -242,6 +304,11 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                     "load_pack_category_mapping",
                     return_value={"happy": "positive reaction"},
                 ),
+                patch.object(collect_sources, "COLLECT_SOURCES_PATH", sources_path),
+                patch.object(
+                    collect_sources, "_pack_exists", lambda _pack_id: True
+                ),
+                patch.object(collect_sources, "default_packs", lambda: ["pack-a"]),
             ):
                 manager = auto_collect.AutoCollectManager(
                     DummyPlugin(),
@@ -289,6 +356,18 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temp_dir)
             packs_dir = root / "packs"
             (packs_dir / "pack-a" / "memes" / "happy").mkdir(parents=True)
+            sources_path = root / "collect_sources.json"
+            sources_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "sources": {
+                            "group:100": {"enabled": True, "packs": ["pack-a"]}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             source = root / "ordinary.png"
             source.write_bytes(png_bytes())
             with (
@@ -300,6 +379,11 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                     "load_pack_category_mapping",
                     return_value={"happy": "positive reaction"},
                 ),
+                patch.object(collect_sources, "COLLECT_SOURCES_PATH", sources_path),
+                patch.object(
+                    collect_sources, "_pack_exists", lambda _pack_id: True
+                ),
+                patch.object(collect_sources, "default_packs", lambda: ["pack-a"]),
                 patch.object(auto_collect.random, "random", return_value=1.0) as roll,
             ):
                 manager = auto_collect.AutoCollectManager(
@@ -357,6 +441,18 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temp_dir)
             packs_dir = root / "packs"
             (packs_dir / "pack-a" / "memes" / "happy").mkdir(parents=True)
+            sources_path = root / "collect_sources.json"
+            sources_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "sources": {
+                            "group:100": {"enabled": True, "packs": ["pack-a"]}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             source = root / "ordinary.png"
             source.write_bytes(png_bytes())
             with (
@@ -368,6 +464,11 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                     "load_pack_category_mapping",
                     return_value={"happy": "positive reaction"},
                 ),
+                patch.object(collect_sources, "COLLECT_SOURCES_PATH", sources_path),
+                patch.object(
+                    collect_sources, "_pack_exists", lambda _pack_id: True
+                ),
+                patch.object(collect_sources, "default_packs", lambda: ["pack-a"]),
             ):
                 config = {
                     "enabled": True,
@@ -428,6 +529,10 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(manager._state["observations"]), 2)
                 self.assertNotIn("pack-a:first", manager._state["observations"])
             with patch.object(
+                auto_collect,
+                "AUTO_COLLECT_STATE_PATH",
+                state_path,
+            ), patch.object(
                 auto_collect.time,
                 "time",
                 return_value=1000000 + auto_collect.OBSERVATION_TTL_SECONDS + 1,
@@ -458,6 +563,18 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temp_dir)
             packs_dir = root / "packs"
             (packs_dir / "pack-a" / "memes" / "happy").mkdir(parents=True)
+            sources_path = root / "collect_sources.json"
+            sources_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "sources": {
+                            "group:100": {"enabled": True, "packs": ["pack-a"]}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             source = root / "event-image.png"
             source.write_bytes(png_bytes())
             with (
@@ -471,6 +588,11 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                     "load_pack_category_mapping",
                     return_value={"happy": "positive reaction"},
                 ),
+                patch.object(collect_sources, "COLLECT_SOURCES_PATH", sources_path),
+                patch.object(
+                    collect_sources, "_pack_exists", lambda _pack_id: True
+                ),
+                patch.object(collect_sources, "default_packs", lambda: ["pack-a"]),
             ):
                 manager = auto_collect.AutoCollectManager(
                     DummyPlugin(),

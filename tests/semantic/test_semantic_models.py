@@ -132,27 +132,12 @@ def test_vector_normalization_and_cosine_similarity():
     vector = models.normalize_vector([3, 4])
     assert vector == pytest.approx([0.6, 0.8])
     assert math.sqrt(sum(value * value for value in vector)) == pytest.approx(1)
-    assert models.cosine_similarity(vector, vector) == pytest.approx(1)
-    assert models.cosine_similarity([1, 0], [0, 1]) == 0
 
 
 @pytest.mark.parametrize("vector", [None, [], [0, 0], [float("nan")], [float("inf")]])
 def test_vector_normalization_rejects_invalid_vectors(vector):
     with pytest.raises(ValueError):
         models.normalize_vector(vector)
-
-
-def test_cosine_similarity_rejects_dimension_mismatch():
-    with pytest.raises(ValueError):
-        models.cosine_similarity([1], [1, 2])
-
-
-def test_short_id_expands_after_prefix_collision():
-    digest = "123456789abc" + "d" * 52
-    assert models.short_id(digest) == "meme:123456789abc"
-    assert models.short_id(digest, ["123456789abc"]) == "meme:123456789abcdddd"
-    with pytest.raises(ValueError):
-        models.short_id("short")
 
 
 def test_build_id_map_uses_unique_prefixes():
@@ -175,19 +160,6 @@ def test_build_id_map_uses_unique_prefixes():
 )
 def test_parse_meme_id(value, expected):
     assert models.parse_meme_id(value) == expected
-
-
-def test_extract_semantic_references_deduplicates_and_cleans_markers():
-    text = (
-        "正常回复\n"
-        "&&meme:123456789abc&&\n"
-        "meme:abcdef123456 候选图片说明。后续正文\n"
-        "再次 meme:123456789abc"
-    )
-    cleaned, references = models.extract_and_clean_semantic_meme_references(text)
-    assert references == ["meme:123456789abc", "meme:abcdef123456"]
-    assert "meme:" not in cleaned
-    assert "正常回复" in cleaned
 
 
 def test_extract_visible_reply_removes_reasoning_and_machine_markers():

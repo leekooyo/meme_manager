@@ -180,6 +180,7 @@ cython_debug/
 # These files should never be committed to Git
 local/
 /data/
+image_host/config.json
 # Local runtime files
 .ruff_cache/
 .env.*

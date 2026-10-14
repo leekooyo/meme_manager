@@ -945,7 +945,7 @@ def get_pack_semantic_summary(
                 1
                 for path in memes_root.rglob("*")
                 if path.is_file()
-                and path.suffix.lower() in IMAGE_EXTENSIONS.union({".webp"})
+                and path.suffix.lower() in IMAGE_EXTENSIONS
             )
             if memes_root.is_dir()
             else 0
@@ -1856,9 +1856,11 @@ def set_image_embedding_failure(
 
 
 def _is_safe_category_key(category: str) -> bool:
-    value = str(category or "").strip()
+    # [patcher:orphan-cleanup] 与 packs.categories.is_safe_category_name 对齐：拒绝首尾空白
+    value = str(category or "")
     return bool(
         value
+        and value == value.strip()
         and value not in {".", ".."}
         and "/" not in value
         and "\\" not in value

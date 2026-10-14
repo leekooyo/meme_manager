@@ -18,6 +18,18 @@ from PIL import Image
 from quart import Quart
 
 
+def _close_image_index():
+    """释放模块级图片索引缓存的 sqlite 连接，避免 Windows 临时目录清理时 WinError 32。"""
+    packs = getattr(auto_collect._IMAGE_INDEX, "_packs", None)
+    if isinstance(packs, dict):
+        for connection in list(packs.values()):
+            try:
+                connection.close()
+            except Exception:
+                pass
+        packs.clear()
+
+
 class FlowEvent:
     """Provide the message interface consumed by the real collection manager."""
 
@@ -72,6 +84,7 @@ class AutoCollectFlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        self.addCleanup(_close_image_index)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.pack_dir = self.root / "packs" / "pack-a"
         (self.pack_dir / "memes").mkdir(parents=True)
@@ -92,6 +105,14 @@ class AutoCollectFlowTests(unittest.IsolatedAsyncioTestCase):
             self.stack.enter_context(
                 patch.object(module, "PACKS_DIR", self.root / "packs")
             )
+        # 显式白名单（Q15/Q19）：本用例的来源需被 collect_sources 认可才允许收图。
+        self.stack.enter_context(
+            patch.object(
+                auto_collect.collect_sources,
+                "resolve_packs",
+                side_effect=lambda key: ["pack-a"] if key else [],
+            )
+        )
         self.decision = {
             "is_meme": True,
             "meme_confidence": 0.97,

@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 
 from backend.meme_parser.text_safety import (
-    find_unprotected_word_spans,
     strip_internal_image_ref_lines,
 )
 
@@ -148,82 +147,6 @@ assert strip_internal_image_ref_lines(
             cwd=repo_root,
             check=True,
         )
-
-
-class FindUnprotectedWordSpansTests(unittest.TestCase):
-    def test_skips_path_uri_markdown_domain_and_filename_tokens(self):
-        examples = (
-            "file:///AstrBot/data/memes/confused/a.jpg",
-            r"C:\AstrBot\data\confused\a.jpg",
-            "/AstrBot/data/memes/confused/a.jpg",
-            "https://example.com/memes/confused/a.jpg",
-            "![confused](https://example.com/a.jpg)",
-            "[meme](assets/confused/a.jpg)",
-            "`/tmp/confused/a.jpg`",
-            "confused.example.com",
-            "confused.jpg",
-        )
-
-        for text in examples:
-            with self.subTest(text=text):
-                self.assertEqual(find_unprotected_word_spans(text, "confused"), [])
-
-    def test_skips_fenced_and_indented_code(self):
-        examples = (
-            "```text\nconfused\n```\n",
-            "~~~\nconfused\n~~~\n",
-            "    confused\n",
-            "\tconfused\n",
-        )
-
-        for text in examples:
-            with self.subTest(text=text):
-                self.assertEqual(find_unprotected_word_spans(text, "confused"), [])
-
-    def test_keeps_natural_prose_available_for_loose_matching(self):
-        examples = (
-            "这次真的 confused！",
-            "选A/B，然后，confused",
-            "见https://example.com/a，然后，confused",
-        )
-
-        for text in examples:
-            with self.subTest(text=text):
-                start = text.index("confused")
-                self.assertEqual(
-                    find_unprotected_word_spans(text, "confused"),
-                    [(start, start + len("confused"))],
-                )
-
-    def test_returns_multiple_natural_matches_in_source_order(self):
-        text = "confused，然后还是 confused"
-        first = text.index("confused")
-        second = text.rindex("confused")
-
-        self.assertEqual(
-            find_unprotected_word_spans(text, "confused"),
-            [
-                (first, first + len("confused")),
-                (second, second + len("confused")),
-            ],
-        )
-
-    def test_keeps_path_match_protected_after_natural_match(self):
-        text = "confused file:///AstrBot/data/memes/confused/a.jpg"
-        first = text.index("confused")
-
-        self.assertEqual(
-            find_unprotected_word_spans(text, "confused"),
-            [(first, first + len("confused"))],
-        )
-
-    def test_handles_many_reference_tokens_without_exposing_matches(self):
-        paths = [
-            f"file:///AstrBot/data/memes/confused/{index}.jpg" for index in range(500)
-        ]
-        text = " ".join(paths)
-
-        self.assertEqual(find_unprotected_word_spans(text, "confused"), [])
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from .backend.auto_collect import AutoCollectManager
 from .backend.packs.categories import CategoryManager
 from .backend.packs.images import IMAGE_EXTENSIONS
 from .backend.semantic.index import EmbeddingAdapter, index_is_ready
-from .backend.semantic.models import runtime_category_mapping
+from .backend.semantic.models import REVIEW_CATEGORY, runtime_category_mapping
 from .backend.semantic.query import (
     candidate_records,
     dumps_result,
@@ -788,7 +788,35 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
             event.set_extra(
                 "meme_manager_runtime_pack_id", str(context.get("pack_id") or "")
             )
+            event.set_extra(
+                "meme_manager_runtime_pack_ids",
+                [str(pid) for pid in (context.get("pack_ids") or [])],
+            )
         return context
+
+    def _get_runtime_pack_ids_for_event(
+        self, event: AstrMessageEvent | None = None
+    ) -> list:
+        """取当前会话绑定的包集合（多包）。优先读事件缓存，否则重新解析。"""
+        if event is not None and hasattr(event, "get_extra"):
+            cached = event.get_extra("meme_manager_runtime_pack_ids")
+            if isinstance(cached, list) and cached:
+                resolved = [str(item) for item in cached if str(item).strip()]
+                if resolved:
+                    return resolved
+
+        from .backend.packs.resolver import resolve_pack_ids
+
+        session_id = ""
+        if event is not None:
+            session_id = str(getattr(event, "session_id", "") or "").strip()
+        persona_id = self._resolve_persona_id(event=event)
+        pack_ids = resolve_pack_ids(
+            session_id=session_id or None, persona_id=persona_id
+        )
+        if event is not None and hasattr(event, "set_extra"):
+            event.set_extra("meme_manager_runtime_pack_ids", list(pack_ids))
+        return list(pack_ids)
 
     def _get_runtime_memes_dir_for_event(self, event: AstrMessageEvent):
         if hasattr(event, "get_extra"):
@@ -892,16 +920,13 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
             if isinstance(context_mapping, dict)
             else runtime_category_mapping(self.category_mapping)
         )
-        # 首次安装时即使没有可用图片，也可能已有分类描述。
-        memes_dir = Path(pack_context["memes_dir"])
+        # Q34：恒显完整规范分类表，**不再**按「该包该分类是否有图」过滤。
+        # 这样主 LLM 系统提示才与「当前用哪个包」解耦，稳定 DeepSeek 前缀缓存；
+        # 若模型选中了某包没有图的分类，由取图侧就地重抽（见 event_handlers）。
         category_mapping = {
             key: description
             for key, description in category_mapping.items()
-            if (memes_dir / key).is_dir()
-            and any(
-                image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS
-                for image in (memes_dir / key).iterdir()
-            )
+            if key != REVIEW_CATEGORY
         }
         req.system_prompt = self._strip_meme_prompt(req.system_prompt)
         if not category_mapping:
