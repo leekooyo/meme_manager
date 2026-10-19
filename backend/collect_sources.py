@@ -7,8 +7,8 @@
     {
       "schema_version": 1,
       "sources": {
-        "group:123456789": {"enabled": true,  "packs": ["example-pack"]},
-        "user:987654321":  {"enabled": false, "packs": ["builtin-default"]}
+        "group:<ID>": {"enabled": true,  "packs": ["example-pack"]},
+        "user:<ID>":  {"enabled": false, "packs": ["builtin-default"]}
       }
     }
 

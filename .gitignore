@@ -187,3 +187,34 @@ image_host/config.json
 *.db
 *.sqlite*
 data/
+
+# Local verification files
+/tests/
+
+# Local data, credentials, and generated files
+/.venv/
+/venv/
+/node_modules/
+/dist/
+/build/
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.pem
+*.key
+*.p12
+*.pfx
+*.bak
+*.tmp
+*.swp
+*~
+/cache/
+/logs/
+/tmp/
+/temp/
+/backups/
+/local/
+/config.json
+/test/
