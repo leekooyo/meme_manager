@@ -493,6 +493,36 @@
           }
         }
       },
+      "rate_limit": {
+        "description": "群级配图冷却",
+        "type": "object",
+        "hint": "启用后，同一个群聊在设定时间内最多自动发送一张表情图；私聊不受限制",
+        "items": {
+          "enabled": {
+            "description": "启用群级配图冷却",
+            "type": "bool",
+            "default": false,
+            "hint": "关闭时保持原有行为。开启后命中冷却的群不再注入表情说明、不再选图，也不会调用选图视觉模型"
+          },
+          "interval_seconds": {
+            "description": "冷却时间",
+            "type": "int",
+            "default": 300,
+            "hint": "同一群两次自动配图的最小间隔，单位秒，0 表示不限制。手动「表情包」命令不受此限制",
+            "slider": {
+              "min": 0,
+              "max": 86400,
+              "step": 30
+            }
+          },
+          "per_group": {
+            "description": "单群覆盖",
+            "type": "dict",
+            "default": {},
+            "hint": "给个别群单独设定间隔，写 JSON 对象，例如 {\"<GROUP_ID>\": 60}。键可写群号或完整 umo，值 0 表示该群不限"
+          }
+        }
+      },
       "prompt": {
         "description": "提示词模板",
         "type": "object",

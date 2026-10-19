@@ -108,6 +108,59 @@ class EventHandlerMixin:
             and origin == LLM_REQUEST_ORIGIN_PLUGIN
         )
 
+    # ---- [patcher:group-cooldown] 群级自动配图冷却 ----
+    def _auto_image_interval(self, event: AstrMessageEvent) -> int:
+        """返回该会话的自动配图冷却秒数；0 表示不受限（私聊/未启用/显式关闭）。"""
+        cooldown = getattr(self, "_image_cooldown", None)
+        if cooldown is None or event is None:
+            return 0
+        return cooldown.interval_for(
+            event,
+            getattr(self, "rate_limit_enabled", False),
+            getattr(self, "rate_limit_interval", 0),
+            getattr(self, "rate_limit_per_group", None),
+        )
+
+    def _auto_image_allowed(self, event: AstrMessageEvent) -> bool:
+        """只读判断：当前会话此刻能否自动发图（判定阶段绝不写时间戳）。"""
+        cooldown = getattr(self, "_image_cooldown", None)
+        if cooldown is None or event is None:
+            return True
+        return cooldown.allows(
+            event,
+            getattr(self, "rate_limit_enabled", False),
+            getattr(self, "rate_limit_interval", 0),
+            getattr(self, "rate_limit_per_group", None),
+        )
+
+    def _auto_image_limited(self, event: AstrMessageEvent) -> bool:
+        """当前会话是否受群级限额约束（用于强制"单条一图、独立发送"）。"""
+        return self._auto_image_interval(event) > 0
+
+    def _auto_image_remaining(self, event: AstrMessageEvent) -> float:
+        """剩余冷却秒数（仅用于日志）。"""
+        cooldown = getattr(self, "_image_cooldown", None)
+        if cooldown is None or event is None:
+            return 0.0
+        return cooldown.remaining(
+            event,
+            getattr(self, "rate_limit_enabled", False),
+            getattr(self, "rate_limit_interval", 0),
+            getattr(self, "rate_limit_per_group", None),
+        )
+
+    def _mark_auto_image_sent(self, event: AstrMessageEvent) -> None:
+        """图片真正发出后记账；不受限的会话不写状态。"""
+        cooldown = getattr(self, "_image_cooldown", None)
+        if cooldown is None or event is None:
+            return
+        cooldown.mark(
+            event,
+            getattr(self, "rate_limit_enabled", False),
+            getattr(self, "rate_limit_interval", 0),
+            getattr(self, "rate_limit_per_group", None),
+        )
+
     def _should_attach_for_result(
         self,
         event: AstrMessageEvent,
@@ -117,6 +170,10 @@ class EventHandlerMixin:
         if result is None:
             return False
         if not self._scope_allows_llm_origin(event):
+            return False
+        # 冷却中直接拒绝附图：这是"抽图 / 转 GIF 之前"的早期闸，
+        # 避免白干活；文本标记的清理不受影响（装饰阶段第一步照旧执行）。
+        if not self._auto_image_allowed(event):
             return False
         content_type = getattr(result, "result_content_type", None)
         content_type_name = str(getattr(content_type, "name", content_type) or "")
@@ -562,16 +619,20 @@ class EventHandlerMixin:
             if hasattr(source, "aclose"):
                 await source.aclose()
 
-    def _limit_meme_selection(self, selections: list[str]) -> list[str]:
+    def _limit_meme_selection(self, selections: list[str], event=None) -> list[str]:
         """Truncate a reply's selected memes before building or sending images.
 
         Args:
             selections: Ordered category names or semantic image IDs.
+            event: 当前消息事件；受限群（群级冷却生效）最多 1 张，
+                既符合"一张/N 秒"的口径，也避免白转多余的 GIF。
 
         Returns:
             The first configured number of selections, or all for a negative limit.
         """
         limit = getattr(self, "max_memes_per_message", -1)
+        if event is not None and self._auto_image_limited(event):
+            limit = 1 if limit < 1 else limit
         return selections[:limit] if limit >= 0 else selections
 
     async def _build_emotion_images_for_event(
@@ -619,7 +680,7 @@ class EventHandlerMixin:
         emotion_images: list[Image] = []
         temp_files: list[str] = []
 
-        for emotion in self._limit_meme_selection(emotions):
+        for emotion in self._limit_meme_selection(emotions, event):
             if not emotion or emotion == REVIEW_CATEGORY:
                 continue
 
@@ -729,6 +790,7 @@ class EventHandlerMixin:
         cleaned_chain: MessageChain = prepared.get("cleaned_chain") or MessageChain([])
         emotion_images: list[Image] = prepared.get("images") or []
         temp_files: list[str] = prepared.get("temp_files") or []
+        sent_images = 0
 
         try:
             if send_text and cleaned_chain.chain:
@@ -736,7 +798,10 @@ class EventHandlerMixin:
 
             if send_images and emotion_images:
                 for image in emotion_images:
-                    await self._send_meme_image(event, image)
+                    # [patcher:group-cooldown] 只有真正发出去的图才计数，
+                    # 被冷却拦下的图片不能报成"已发送"。
+                    if await self._send_meme_image(event, image):
+                        sent_images += 1
         finally:
             for temp_file in temp_files:
                 try:
@@ -747,7 +812,7 @@ class EventHandlerMixin:
 
         return {
             "sent_text": bool(send_text and cleaned_chain.chain),
-            "sent_images_count": len(emotion_images) if send_images else 0,
+            "sent_images_count": sent_images,
             "detected_emotions": prepared.get("emotions") or [],
         }
 
@@ -1091,6 +1156,12 @@ class EventHandlerMixin:
         # 在任何异步工作前占用本次响应，防止重复钩子覆盖语义选择结果或
         # 旧版分类匹配结果。
         event.set_extra("meme_manager_semantic_response_processed", True)
+        # [patcher:group-cooldown] 响应闸：冷却中丢弃选图结果并跳过情感模型，
+        # 但**仍然清理文本标记**（只清理、不发图）。
+        if not self._auto_image_allowed(event):
+            return await self._resp_quota_blocked_impl(
+                event, response, text, semantic_mode
+            )
         if semantic_mode == "llm":
             return await self._resp_semantic_llm_impl(event, response, text)
         if semantic_mode == "tool":
@@ -1194,6 +1265,63 @@ class EventHandlerMixin:
             except Exception as e:
                 logger.error(f"[meme_manager] webchat 流式文本替换失败: {e}")
 
+    async def _resp_quota_blocked_impl(
+        self,
+        event: AstrMessageEvent,
+        response: LLMResponse,
+        text: str,
+        semantic_mode: str,
+    ):
+        """群级配图冷却中的响应处理：只清理标记，不发图。
+
+        与正常路径的区别只有两点：丢弃选图结果、跳过情感辅助模型；
+        **文本清理照旧执行**，否则 ``&&分类键&&`` 会原样出现在聊天窗口里。
+
+        Args:
+            event: 当前消息事件。
+            response: 待处理的 LLM 响应。
+            text: 已移除内部图片引用行的正文。
+            semantic_mode: 请求阶段确定的语义模式（可能为空 = 旧分类模式）。
+        """
+        categories = set()
+        if not semantic_mode:
+            pack_context = self._resolve_runtime_pack_context(event=event)
+            context_mapping = pack_context.get("category_mapping")
+            active_mapping = (
+                runtime_category_mapping(context_mapping)
+                if isinstance(context_mapping, dict)
+                else runtime_category_mapping(self.category_mapping)
+            )
+            categories = set(active_mapping.keys())
+
+        # fallbacks=False：只吞严格的 &&...&& 与有效的替代标记，
+        # 不做"单独成行的分类词"猜测，避免误删正常正文。
+        parser = self._make_meme_parser(categories, fallbacks=False)
+        clean_text = parser.feed(text or "") + parser.finish()
+        if getattr(self, "filter_all_tags", False):
+            clean_text = self._clean_outgoing_plain_text(clean_text)
+
+        event.set_extra("found_emotions", None)
+        event.set_extra("meme_manager_semantic_selected_ids", None)
+        event.set_extra("meme_manager_legacy_probability_hit", False)
+        response.completion_text = clean_text.strip()
+        logger.info(
+            "[meme_manager] 群级配图冷却中，本轮不配图（剩余 %.0f 秒）",
+            self._auto_image_remaining(event),
+        )
+
+        result = event.get_result()
+        if (
+            event.get_platform_name() == "webchat"
+            and not event.get_extra("meme_manager_stream_filtered")
+            and result is not None
+            and result.result_content_type == ResultContentType.STREAMING_RESULT
+        ):
+            try:
+                await event.send(MessageChain([Plain(response.completion_text)]))
+            except Exception as exc:
+                logger.error("[meme_manager] webchat 冷却期文本替换失败: %s", exc)
+
     async def _resp_semantic_impl(
         self, event: AstrMessageEvent, response: LLMResponse, text: str
     ):
@@ -1290,7 +1418,9 @@ class EventHandlerMixin:
                 pack_context = self._resolve_runtime_pack_context(event=event)
                 semantic_images = []
                 semantic_temp_files = []
-                for selected_id in self._limit_meme_selection(semantic_selected_ids):
+                for selected_id in self._limit_meme_selection(
+                    semantic_selected_ids, event
+                ):
                     image_path = validate_selected_id(
                         event, selected_id, pack_context.get("pack_dir")
                     )
@@ -1305,9 +1435,18 @@ class EventHandlerMixin:
                         semantic_images.append(Image.fromFileSystem(final_path))
                     except Exception as exc:
                         logger.error("构建语义表情图片失败: %s", exc)
-                if semantic_temp_files:
+                limited_session = self._auto_image_limited(event)
+                # 受限群的纯图片回复：空消息链会让核心 respond stage 直接返回
+                # （不触发 after_message_sent），pending 图片与临时 GIF 都会无人消费，
+                # 因此就地单发，并由发送函数自行清理临时文件。
+                inline_image_only = limited_session and not cleaned_components
+                if semantic_temp_files and not inline_image_only:
                     event.set_extra("meme_manager_temp_files", semantic_temp_files)
-                if semantic_images:
+                if inline_image_only:
+                    await self._send_restricted_image_only(
+                        event, semantic_images, semantic_temp_files
+                    )
+                elif semantic_images:
                     # 语义模式不再随机丢弃模型已经选择的候选；
                     # 发送方式（合并/分离）按 mixed_message 概率决定，与旧版路径一致。
                     use_mixed_message = not cleaned_components
@@ -1315,6 +1454,10 @@ class EventHandlerMixin:
                         use_mixed_message = (
                             random.randint(1, 100) <= self.mixed_message_probability
                         )
+                    if limited_session:
+                        # 受限群不再图文混排：图片统一作为独立消息发送，
+                        # 让"检查冷却 → 发送 → 成功记账"只有一个结算点。
+                        use_mixed_message = False
                     if use_mixed_message and self.send_image_as_base64:
                         normalized_images = []
                         for image in semantic_images:
@@ -1343,7 +1486,7 @@ class EventHandlerMixin:
                     # 创建表情图片列表
                     emotion_images = []
                     temp_files = []  # 记录临时文件路径
-                    for emotion in self._limit_meme_selection(found_emotions):
+                    for emotion in self._limit_meme_selection(found_emotions, event):
                         if not emotion or emotion == REVIEW_CATEGORY:
                             continue
 
@@ -1380,8 +1523,10 @@ class EventHandlerMixin:
                             logger.error(f"添加表情图片失败: {e}")
 
                     if emotion_images:
-                        # 记录临时文件到 event extra
-                        if temp_files:
+                        legacy_limited = self._auto_image_limited(event)
+                        legacy_inline_only = legacy_limited and not cleaned_components
+                        if temp_files and not legacy_inline_only:
+                            # 记录临时文件到 event extra
                             existing_temp_files = (
                                 event.get_extra("meme_manager_temp_files") or []
                             )
@@ -1390,28 +1535,38 @@ class EventHandlerMixin:
                                 existing_temp_files + temp_files,
                             )
 
-                        use_mixed_message = not cleaned_components
-                        if cleaned_components and self.enable_mixed_message:
-                            use_mixed_message = (
-                                random.randint(1, 100) <= self.mixed_message_probability
-                            )
-
-                        if use_mixed_message and self.send_image_as_base64:
-                            normalized_images = []
-                            for image in emotion_images:
-                                normalized_images.append(
-                                    await self._ensure_image_send_format(image)
-                                )
-                            emotion_images = normalized_images
-
-                        if use_mixed_message:
-                            cleaned_components = self._merge_components_with_images(
-                                cleaned_components, emotion_images
+                        if legacy_inline_only:
+                            # 同语义分支：纯图片回复空链不会触发 after_message_sent，
+                            # 就地发送并自行清理临时 GIF。
+                            await self._send_restricted_image_only(
+                                event, emotion_images, temp_files
                             )
                         else:
-                            event.set_extra(
-                                "meme_manager_pending_images", emotion_images
-                            )
+                            use_mixed_message = not cleaned_components
+                            if cleaned_components and self.enable_mixed_message:
+                                use_mixed_message = (
+                                    random.randint(1, 100)
+                                    <= self.mixed_message_probability
+                                )
+                            if legacy_limited:
+                                use_mixed_message = False
+
+                            if use_mixed_message and self.send_image_as_base64:
+                                normalized_images = []
+                                for image in emotion_images:
+                                    normalized_images.append(
+                                        await self._ensure_image_send_format(image)
+                                    )
+                                emotion_images = normalized_images
+
+                            if use_mixed_message:
+                                cleaned_components = self._merge_components_with_images(
+                                    cleaned_components, emotion_images
+                                )
+                            else:
+                                event.set_extra(
+                                    "meme_manager_pending_images", emotion_images
+                                )
                     else:
                         pass
 
@@ -1515,7 +1670,9 @@ class EventHandlerMixin:
         if semantic_selected_ids and self._semantic_mode_active(event):
             pack_context = self._resolve_runtime_pack_context(event=event)
             try:
-                for selected_id in self._limit_meme_selection(semantic_selected_ids):
+                for selected_id in self._limit_meme_selection(
+                    semantic_selected_ids, event
+                ):
                     image_path = validate_selected_id(
                         event, selected_id, pack_context.get("pack_dir")
                     )
@@ -1576,7 +1733,7 @@ class EventHandlerMixin:
                 and _stream_images(entry)
             ]
 
-            for emotion in self._limit_meme_selection(found_emotions):
+            for emotion in self._limit_meme_selection(found_emotions, event):
                 if not emotion or emotion == REVIEW_CATEGORY:
                     continue
 
@@ -1619,12 +1776,67 @@ class EventHandlerMixin:
         finally:
             event.set_extra("found_emotions", None)
 
-    async def _send_meme_image(self, event: AstrMessageEvent, image: Image) -> None:
+    async def _send_restricted_image_only(
+        self,
+        event: AstrMessageEvent,
+        images: list[Image],
+        temp_files: list[str],
+    ) -> None:
+        """受限群的纯图片回复：就地发送单张，并自行清理临时 GIF。
+
+        空消息链会让核心 respond stage 直接返回、不触发 ``after_message_sent``，
+        所以临时文件清理必须在这里用 ``finally`` 兜住（发送失败同样要清）。
+
+        Args:
+            event: 当前消息事件。
+            images: 已构建好的图片组件（只取第一张）。
+            temp_files: 为本轮转换产生的临时文件路径。
+        """
+        try:
+            for image in (images or [])[:1]:
+                try:
+                    await self._send_meme_image(event, image)
+                except Exception as exc:
+                    logger.error("[meme_manager] 受限群纯图片发送失败: %s", exc)
+        finally:
+            for path in temp_files or []:
+                try:
+                    if path and os.path.exists(path):
+                        os.remove(path)
+                except Exception as exc:
+                    logger.error("[meme_manager] 清理受限群临时图片失败: %s", exc)
+
+    async def _send_meme_image(self, event: AstrMessageEvent, image: Image) -> bool:
+        """发送单张表情图。
+
+        [patcher:group-cooldown] 这是**所有自动配图的统一出口**：
+        B（待发图）、C（流式）、E（免模型随机）、F（其它插件调用本插件）
+        都经由这里，因此"读判 → 发送 → 成功后记账"只在这一处实现。
+
+        Returns:
+            真正发送成功返回 True；被冷却拦下或平台缺失返回 False。
+        """
+        if not self._auto_image_allowed(event):
+            logger.debug(
+                "[meme_manager] 群级配图冷却中，丢弃待发图片（剩余 %.0f 秒）",
+                self._auto_image_remaining(event),
+            )
+            return False
         image = await self._ensure_image_send_format(image)
         if event.get_platform_name() in {"gewechat", "webchat"}:
             await event.send(MessageChain([image]))
-            return
-        await self.context.send_message(event.unified_msg_origin, MessageChain([image]))
+            self._mark_auto_image_sent(event)
+            return True
+        sent = await self.context.send_message(
+            event.unified_msg_origin, MessageChain([image])
+        )
+        if sent is False:
+            # 核心找不到对应平台时会返回 False（消息根本没发出去），
+            # 此时不能记账，否则会白扣一个冷却窗口。
+            logger.warning("[meme_manager] 未找到可发送平台，表情图片未送出")
+            return False
+        self._mark_auto_image_sent(event)
+        return True
 
     async def _ensure_image_send_format(self, image: Image) -> Image:
         """根据配置规范图片发送格式。"""

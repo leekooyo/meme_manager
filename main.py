@@ -28,6 +28,11 @@ from .config import (
     DEFAULT_CATEGORY_DESCRIPTIONS,
     PLUGIN_DATA_DIR,
 )
+from .backend.rate_limit import (
+    GroupImageCooldown,
+    normalize_group_map,
+    parse_interval,
+)
 from .image_host.img_sync import ImageSync
 from .mixins.commands import CommandMixin
 from .mixins.event_handlers import EventHandlerMixin, normalize_trigger_scope
@@ -274,6 +279,28 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
                 default="only_chat_llm",
             )
         )
+        # [patcher:group-cooldown] 群级自动配图冷却：默认关闭，启用后同群
+        # 在 interval_seconds 内最多自动发一张图；per_group 可按群覆盖。
+        self.rate_limit_enabled = bool(
+            self._read_config_value(
+                ("generation", "rate_limit", "enabled"),
+                default=False,
+            )
+        )
+        self.rate_limit_interval = parse_interval(
+            self._read_config_value(
+                ("generation", "rate_limit", "interval_seconds"),
+                default=300,
+            ),
+            300,
+        )
+        self.rate_limit_per_group = normalize_group_map(
+            self._read_config_value(
+                ("generation", "rate_limit", "per_group"),
+                default=None,
+            )
+        )
+        self._image_cooldown = GroupImageCooldown()
 
         # 构建表情包提示词
         self.sys_prompt_add = ""
@@ -873,17 +900,21 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
     def _apply_request_prompt(
         self, req: ProviderRequest, event: AstrMessageEvent | None = None
     ) -> None:
+        # [patcher:group-cooldown] 注入闸（只读）：冷却期内干脆不教模型配图。
+        # 这样模型不会持续输出标记又被发送闸丢弃（"bot 突然不会配图"的手感事故）。
+        auto_image_allowed = self._auto_image_allowed(event)
         semantic_mode = ""
         semantic_tool_ready = False
-        if self.emotion_llm_enabled:
-            if self._semantic_pack_ready(event=event, req=req):
-                semantic_mode = "llm"
-        else:
-            semantic_tool_ready = self._semantic_pack_ready(
-                event=event, req=req, require_tool=True
-            )
-            if semantic_tool_ready:
-                semantic_mode = "tool"
+        if auto_image_allowed:
+            if self.emotion_llm_enabled:
+                if self._semantic_pack_ready(event=event, req=req):
+                    semantic_mode = "llm"
+            else:
+                semantic_tool_ready = self._semantic_pack_ready(
+                    event=event, req=req, require_tool=True
+                )
+                if semantic_tool_ready:
+                    semantic_mode = "tool"
         semantic_active = bool(semantic_mode)
         if event is not None and hasattr(event, "set_extra"):
             event.set_extra("meme_manager_semantic_active", semantic_active)
@@ -903,6 +934,12 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
             event.set_extra("meme_manager_stream_filtered", False)
             event.set_extra("meme_manager_reply_provider_id", "")
             event.set_extra("meme_manager_reply_model", "")
+        if not auto_image_allowed:
+            # 冷却中：收走语义工具 + 剥掉表情说明，避免模型继续调用/输出标记。
+            # 标记即使仍被输出，响应阶段的文本清理也会抹掉（见 _resp_impl）。
+            self._remove_semantic_tool(req)
+            req.system_prompt = self._strip_meme_prompt(req.system_prompt)
+            return
         if semantic_mode == "tool":
             req.system_prompt = (
                 self._strip_meme_prompt(req.system_prompt)

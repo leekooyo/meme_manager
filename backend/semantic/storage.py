@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
+    CAPTION_SKIPPED_GIF,
     IMAGE_EXTENSIONS,
     PROMPT_VERSION,
     REVIEW_CATEGORY,
@@ -911,9 +912,13 @@ def semantic_metadata_is_complete(
             and recorded_unique_total == len(current_entry_ids)
             and all(
                 isinstance(images.get(entry_id), dict)
-                and semantic_caption_is_complete(images[entry_id])
+                and (
+                    semantic_caption_is_complete(images[entry_id])
+                    or images[entry_id].get("caption_status") == CAPTION_SKIPPED_GIF
+                )
                 and (
                     not require_embeddings
+                    or images[entry_id].get("caption_status") == CAPTION_SKIPPED_GIF
                     or images[entry_id].get("category") == REVIEW_CATEGORY
                     or images[entry_id].get("embedding_status") == "done"
                 )
@@ -1005,6 +1010,10 @@ def get_pack_semantic_summary(
         and item.get("tags")
     )
     caption_failed = sum(1 for item in images if item.get("caption_status") == "failed")
+    # GIF 按规则跳过视觉识别：单独计数，不计入失败，也不算「已有描述」。
+    caption_skipped_gif = sum(
+        1 for item in images if item.get("caption_status") == CAPTION_SKIPPED_GIF
+    )
     try:
         recorded_unique_total = int(metadata.get("unique_total", len(images)))
     except (TypeError, ValueError):
@@ -1022,13 +1031,15 @@ def get_pack_semantic_summary(
         except (TypeError, ValueError):
             snapshot_file_total = -1
     snapshot_matches = snapshot_file_total == current_file_total
-    all_records_done = bool(images) and caption_done == len(images)
+    # 跳过视觉识别的 GIF 也属于「无剩余工作」，但绝不并入 caption_done。
+    caption_covered = caption_done + caption_skipped_gif
+    all_records_done = bool(images) and caption_covered == len(images)
     completion_candidate = (
         current_file_total > 0
         and semantic_total > 0
         and snapshot_matches
         and all_records_done
-        and caption_done >= semantic_total
+        and caption_covered >= semantic_total
     )
     strictly_complete = bool(
         completion_candidate
@@ -1046,6 +1057,7 @@ def get_pack_semantic_summary(
         "semantic_caption_done": caption_done,
         "semantic_caption_total": semantic_total,
         "semantic_caption_failed": caption_failed,
+        "semantic_caption_skipped_gif": caption_skipped_gif,
         "semantic_file_total": current_file_total,
         "semantic_snapshot_matches": snapshot_matches,
         "semantic_files_changed": bool(
@@ -1087,6 +1099,7 @@ def _same_content_paths_via_index(
             rows = None
         if rows:
             matches: set[str] = set()
+            outside_root = 0
             for row in rows:
                 try:
                     candidate = Path(str(row[0]))
@@ -1097,14 +1110,20 @@ def _same_content_paths_via_index(
                 try:
                     candidate.resolve().relative_to(memes_root)
                 except (OSError, RuntimeError, ValueError):
+                    outside_root += 1
                     continue
                 if not candidate.is_file():
+                    outside_root += 1
                     continue
                 try:
                     matches.add(candidate.relative_to(root).as_posix())
                 except (OSError, ValueError):
+                    outside_root += 1
                     continue
-            return sorted(matches)
+            if matches or not outside_root:
+                return sorted(matches)
+            # 索引里的候选**全部**越界或已不存在（典型：图库改过 ID，库内仍是旧路径）
+            # ⇒ 索引不可信，回落到下面的原始全量扫描，避免提示静默失效。
 
     source_size = source.stat().st_size
     fallback: list[str] = []
@@ -1589,16 +1608,23 @@ def save_collected_image_semantic(
         item.auto_category_review_status = "auto_match"
     else:
         item.caption = ""
+        # GIF 按规则跳过了视觉识别：记终态 skipped_gif，不能伪装成 done，
+        # 也不能塞进 pending 让后面的任务反复补描述。
+        if str(decision.get("vision_skipped") or "").strip() == CAPTION_SKIPPED_GIF:
+            item.caption_status = CAPTION_SKIPPED_GIF
+            item.embedding_status = "cleared"
+        else:
+            item.caption_status = "pending"
         item.tags = ensure_category_tag([], item.category)
         item.visible_text = ""
-        item.caption_status = "pending"
     if manual_confirmed and item.category != REVIEW_CATEGORY:
         item.category_fit = "match"
         item.category_review_status = "manual_confirmed"
         item.category_review_context_hash = item.category_context_hash
         item.manual_confirmation_context_hash = item.category_context_hash
     item.vision_model = str(decision.get("vision_model") or "")
-    item.embedding_status = "pending"
+    if item.caption_status != CAPTION_SKIPPED_GIF:
+        item.embedding_status = "pending"
     item.text_hash = text_hash(item.vector_text) if reusable else ""
     item.updated_at = utc_now()
     _assert_image_snapshot_unchanged(root, source, digest, entry_id)

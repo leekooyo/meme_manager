@@ -14,6 +14,21 @@ from .models import (
     parse_caption_result_with_review,
 )
 
+
+def is_gif_source(path: Path | str) -> bool:
+    """按文件内容判断是否为 GIF（只看真实字节，不看扩展名）。
+
+    GIF 一律跳过视觉模型：不构造请求、不重试、不切换模型。读取失败时返回
+    False，让调用方保持原有的失败处理路径。
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(Path(path)) as image:
+            return str(image.format or "").upper() == "GIF"
+    except Exception:  # noqa: BLE001
+        return False
+
 CAPTION_ANALYSIS_PROMPT = """你是中文互联网表情包语义分析员。你的任务不是给图片写普通图注，而是还原这张图作为聊天回复时真正传达的意思，让人能够按对话情境准确搜索到它。
 
 请在内部完成以下分析，不要输出分析过程：

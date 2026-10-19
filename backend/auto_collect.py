@@ -60,6 +60,9 @@ FORMAT_EXTENSIONS = {
     "WEBP": ".webp",
 }
 
+#: GIF 统一跳过视觉模型的判定值（来自 `_validate_image` 的内容嗅探）。
+GIF_EXTENSION = ".gif"
+
 AUTO_COLLECT_SYSTEM_PROMPT = (
     """你是聊天表情包审核与分类器。请判断图片是否适合保存为聊天表情包，并从给定分类中选择最合适的一项。
 普通照片、文档截图、聊天记录截图、商品图、二维码、收付款码、广告和没有明确聊天反应用途的图片默认不是表情包。
@@ -1202,6 +1205,31 @@ class AutoCollectManager:
                 return name
         return REVIEW_CATEGORY
 
+    @staticmethod
+    def _gif_skip_decision() -> dict[str, Any]:
+        """GIF 跳过视觉识别时使用的规范化结果。
+
+        描述、标签与可见文字一律留空：GIF 没有真实模型描述，不能让占位文案
+        冒充描述去参与语义检索或向量生成。``vision_skipped`` 是与「请求失败」
+        区分开的明确结果标记。
+        """
+        return {
+            "semantic_prompt_version": PROMPT_VERSION,
+            "semantic_category": "",
+            "vision_model": "",
+            "vision_skipped": "skipped_gif",
+            "is_meme": True,
+            "meme_confidence": 1.0,
+            "category": "",
+            # 分类置信度必须为 0：跳过的 GIF 没有分类结论，不能在审核列表里
+            # 压过真实模型结果。
+            "category_confidence": 0.0,
+            "reason": "GIF 动图按规则跳过视觉识别",
+            "caption": "",
+            "tags": [],
+            "visible_text": "",
+        }
+
     async def _process_job(self, job: AutoCollectJob) -> None:
         """下载、去重、分类，并把同一张图**复制镜像**进每个目标表情包。
 
@@ -1213,20 +1241,34 @@ class AutoCollectManager:
         digest = hashlib.sha256(content).hexdigest()
 
         # ---- 视觉识别只跑一次：分类表取主包＝默认图库（Q30=乙）----
-        cache_key = self._cache_key(digest, job.main_pack_id, job.categories)
-        decisions = self._state.get("decisions", {})
-        decision = decisions.get(cache_key) if isinstance(decisions, dict) else None
-        if not isinstance(decision, dict):
-            if not self._daily_call_available():
-                self.counters["quota"] = self.counters.get("quota", 0) + 1
-                logger.info(
-                    "[meme_manager] 自动收集跳过图片：已达到每日识别上限，主包：%s，图片摘要：%s",
-                    job.main_pack_id,
-                    digest[:12],
-                )
-                return
-            decision = await self._classify(content, extension, job.categories)
-            self._remember_decision(cache_key, decision)
+        # [patcher:gif-skip] GIF 动图不调用视觉模型：不构造请求、不占用每日
+        # 识别配额、不写决策缓存；去重、收集与入库流程保持原样。扩展名来自
+        # _validate_image 的内容嗅探，因此扩展名伪装的文件同样会被识别为 GIF。
+        if extension == GIF_EXTENSION:
+            decision = self._gif_skip_decision()
+            self.counters["skipped_gif"] = self.counters.get("skipped_gif", 0) + 1
+            logger.info(
+                "[meme_manager] 自动收集跳过视觉识别：skipped_gif，主包：%s，图片摘要：%s",
+                job.main_pack_id,
+                digest[:12],
+            )
+        else:
+            cache_key = self._cache_key(digest, job.main_pack_id, job.categories)
+            decisions = self._state.get("decisions", {})
+            decision = (
+                decisions.get(cache_key) if isinstance(decisions, dict) else None
+            )
+            if not isinstance(decision, dict):
+                if not self._daily_call_available():
+                    self.counters["quota"] = self.counters.get("quota", 0) + 1
+                    logger.info(
+                        "[meme_manager] 自动收集跳过图片：已达到每日识别上限，主包：%s，图片摘要：%s",
+                        job.main_pack_id,
+                        digest[:12],
+                    )
+                    return
+                decision = await self._classify(content, extension, job.categories)
+                self._remember_decision(cache_key, decision)
         if (
             not bool(decision.get("is_meme"))
             or float(decision.get("meme_confidence", 0) or 0) < self.min_meme_confidence
@@ -1255,13 +1297,16 @@ class AutoCollectManager:
         match = await asyncio.to_thread(
             _IMAGE_INDEX.lookup, main_memes_dir, digest, job.snapshot_path
         )
-        if match.similar_path is not None:
-            decision = {
-                **decision,
-                "near_duplicate": str(
-                    match.similar_path.relative_to(main_memes_dir)
-                ).replace("\\", "/"),
-            }
+        # 命中结果自带「所属图库 + 相对路径」：命中图片属于哪个图库与本次收集
+        # 目标图库不是同一个概念，不能再用 main_memes_dir 去解释所有命中路径。
+        near_duplicate = match.source_label()
+        if near_duplicate:
+            decision = {**decision, "near_duplicate": near_duplicate}
+        elif match.similar_path is not None:
+            logger.warning(
+                "[meme_manager] 近似命中无法定位所属图库，已忽略该提示：%s",
+                match.similar_path,
+            )
 
         # ---- 逐包镜像写入（Q18=甲）；分类名映射（Q23=乙）；去重 per-pack（Q24=甲）----
         for pack_id in job.target_pack_ids:

@@ -65,6 +65,15 @@ async function initPluginConfig() {
         "不调用聊天模型，按概率主动发图。骰子1决定这一轮发不发，骰子2决定纯随机抽图还是让模型读用户消息选分类。",
       prefixes: ["generation.llm_free_random."],
     },
+    // [patcher:group-cooldown] 群级配图冷却（与 _conf_schema.json 的 generation.rate_limit 一一对应）
+    {
+      id: "rate-limit",
+      category: "sending",
+      title: "群级配图冷却",
+      description:
+        "同一个群在设定时间内最多自动发一张表情图。冷却中不注入表情说明、不选图，也不调用选图模型；私聊与手动「表情包」命令不受影响。",
+      prefixes: ["generation.rate_limit."],
+    },
     {
       id: "semantic",
       category: "models",
@@ -217,6 +226,16 @@ async function initPluginConfig() {
       prefixes: ["generation.matching."],
     },
   ];
+  // 渲染时实际使用的分组：默认等于 groups；若有字段没被任何前缀命中，
+  // 追加一个「其他」兜底卡片，避免单个新字段让整页读取失败。
+  let activeGroups = groups;
+  const matchGroup = (list, path) =>
+    list.find((item) =>
+      item.prefixes.some((prefix) =>
+        prefix.endsWith(".") ? path.startsWith(prefix) : path === prefix,
+      ),
+    );
+
   const labels = {
     "generation.trigger.scope": "应用范围",
     "generation.emotion.probability": "表情出现概率（%）",
@@ -289,7 +308,7 @@ async function initPluginConfig() {
     const selectedProvider =
       changes.get("storage.provider") ?? fields.get("storage.provider")?.value;
     let visibleCount = 0;
-    for (const group of groups) {
+    for (const group of activeGroups) {
       const card = document.getElementById(`config-group-${group.id}`);
       if (!card) continue;
       let matches = 0;
@@ -336,7 +355,29 @@ async function initPluginConfig() {
     fields.clear();
     controls.clear();
     sections.replaceChildren();
-    for (const group of groups) {
+    const orphans = snapshot.fields.filter(
+      (field) => !matchGroup(groups, field.path),
+    );
+    if (orphans.length) {
+      console.warn(
+        "[settings] 以下配置项没有匹配的分类，已放入「其他」：",
+        orphans.map((field) => field.path),
+      );
+      activeGroups = [
+        ...groups,
+        {
+          id: "ungrouped",
+          category: "sending",
+          title: "其他",
+          description:
+            "这些设置还没有归入上面的分类，功能不受影响；在 config.js 的 groups 里补一条前缀即可归类。",
+          prefixes: [],
+        },
+      ];
+    } else {
+      activeGroups = groups;
+    }
+    for (const group of activeGroups) {
       const card = document.createElement("section");
       card.className = "panel config-card";
       card.id = `config-group-${group.id}`;
@@ -368,20 +409,15 @@ async function initPluginConfig() {
       sections.append(card);
     }
     for (const field of snapshot.fields) {
-      const assigned = groups.find((item) =>
-        item.prefixes.some((prefix) =>
-          prefix.endsWith(".")
-            ? field.path.startsWith(prefix)
-            : field.path === prefix,
-        ),
-      );
-      if (!assigned) throw new Error("配置分类已更新，请刷新页面后重试");
+      const assigned =
+        matchGroup(activeGroups, field.path) ||
+        activeGroups[activeGroups.length - 1];
       field.category = assigned.category;
       fields.set(field.path, field);
       const row = document.createElement("div");
       row.className = `config-field${
         field.type === "bool" ? " config-switch-field" : ""
-      }${["text", "list"].includes(field.type) ? " config-field-wide" : ""}`;
+      }${["text", "list", "dict"].includes(field.type) ? " config-field-wide" : ""}`;
       row.dataset.search = [
         labels[field.path] || field.label,
         field.hint,
@@ -458,7 +494,7 @@ async function initPluginConfig() {
         )
           control.add(new Option(`${field.value}（当前不可用）`, field.value));
         control.value = field.value;
-      } else if (["text", "list"].includes(field.type)) {
+      } else if (["text", "list", "dict"].includes(field.type)) {
         control = document.createElement("textarea");
         control.rows = field.type === "text" ? 7 : 4;
         control.value =

@@ -201,8 +201,9 @@ class AutoCollectFlowTests(unittest.IsolatedAsyncioTestCase):
             source.unlink()
             await asyncio.wait_for(manager.queue.join(), 5)
         self.assertEqual(list((self.root / "queue").iterdir()), [])
-        self.assertEqual(self.vision.await_count, 2)
-        self.assertEqual([len(paths) for paths in self.visual_requests], [1, 2])
+        # GIF 不调用视觉模型：只有 PNG 真正发起了一次请求，且只带 1 张图。
+        self.assertEqual(self.vision.await_count, 1)
+        self.assertEqual([len(paths) for paths in self.visual_requests], [1])
         self.assertTrue(
             all(not path.exists() for paths in self.visual_requests for path in paths)
         )
@@ -212,13 +213,17 @@ class AutoCollectFlowTests(unittest.IsolatedAsyncioTestCase):
         pending = await response.get_json()
         self.assertTrue(pending["visible"])
         self.assertEqual(pending["count"], 2)
+        # 跳过的 GIF 没有分类结论（置信度 0），排在真实模型结果之后。
         self.assertEqual(
-            [item["category_confidence"] for item in pending["items"]], [0.91, 0.72]
+            [item["category_confidence"] for item in pending["items"]], [0.72, 0.0]
         )
         self.assertEqual(pending["categories"]["sad"], "sad reaction")
         preview_mimes = set()
         for item in pending["items"]:
-            self.assertEqual(item["suggested_category"], "happy")
+            self.assertEqual(
+                item["suggested_category"],
+                "needs_review" if item["category_confidence"] == 0 else "happy",
+            )
             preview = await self.client.get(
                 "/inbox/image_data",
                 query_string={"pack_id": "pack-a", "id": item["id"]},
@@ -260,10 +265,16 @@ class AutoCollectFlowTests(unittest.IsolatedAsyncioTestCase):
         metadata = load_metadata(self.pack_dir)
         self.assertEqual(len(metadata["images"]), 2)
         for item in metadata["images"].values():
-            self.assertEqual(item["caption_status"], "pending")
-            self.assertEqual(item["auto_caption"], self.decision["caption"])
+            if item["relative_path"].endswith(".gif"):
+                # GIF 跳过视觉识别：不伪造 done，也不回到 pending 反复补描述。
+                self.assertEqual(item["caption_status"], "skipped_gif")
+                self.assertEqual(item["auto_caption"], "")
+                self.assertEqual(item["auto_tags"], [])
+            else:
+                self.assertEqual(item["caption_status"], "pending")
+                self.assertEqual(item["auto_caption"], self.decision["caption"])
+                self.assertEqual(item["embedding_status"], "pending")
             self.assertEqual(item["category_review_status"], "manual_confirmed")
-            self.assertEqual(item["embedding_status"], "pending")
         after = await self.client.get("/inbox", query_string={"pack_id": "pack-a"})
         self.assertEqual((await after.get_json())["count"], 0)
         self.assertFalse(self.host.semantic_task_manager._index_tasks)
@@ -365,12 +376,28 @@ class AutoCollectFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(self.host.semantic_task_manager._tasks)
                 self.assertFalse(self.host.semantic_task_manager._index_tasks)
         self.assertEqual(self.host.reload_count, 2)
-        self.assertEqual(self.vision.await_count, 2)
-        for item in load_metadata(self.pack_dir)["images"].values():
-            self.assertEqual(item["caption_status"], "done")
-            self.assertEqual(item["caption"], self.decision["caption"])
-            self.assertEqual(item["category"], "happy")
-            self.assertEqual(item["embedding_status"], "pending")
+        # GIF 跳过视觉识别：只有 PNG 调用了一次模型。
+        self.assertEqual(self.vision.await_count, 1)
+        images = load_metadata(self.pack_dir)["images"]
+        png_item = next(
+            item for item in images.values() if item["relative_path"].endswith(".png")
+        )
+        gif_item = next(
+            item for item in images.values() if item["relative_path"].endswith(".gif")
+        )
+        # PNG 沿用原有描述流程。
+        self.assertEqual(png_item["caption_status"], "done")
+        self.assertEqual(png_item["caption"], self.decision["caption"])
+        self.assertEqual(png_item["category"], "happy")
+        self.assertEqual(png_item["embedding_status"], "pending")
+        # GIF 仍然完成收集与入库，但没有描述、没有标签、没有向量，
+        # 状态记为 skipped_gif，与请求失败区分。
+        self.assertEqual(gif_item["caption_status"], "skipped_gif")
+        self.assertEqual(gif_item["caption"], "")
+        # 只有分类哨兵标签，没有任何描述生成的标签。
+        self.assertEqual(gif_item["auto_tags"], [])
+        self.assertEqual(gif_item["category"], "needs_review")
+        self.assertEqual(gif_item["embedding_status"], "cleared")
 
     async def test_ordinary_image_filtered_and_failed_vision_can_retry(self):
         manager = self.host.auto_collect_manager

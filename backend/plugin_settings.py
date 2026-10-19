@@ -40,6 +40,8 @@ def describe_settings(config) -> tuple[dict, dict]:
         "int": 0,
         "float": 0,
         "list": [],
+        # [patcher:group-cooldown] 自由映射（如 generation.rate_limit.per_group）
+        "dict": {},
     }
     while pending:
         prefix, items, current, groups = pending.pop()
@@ -76,8 +78,52 @@ def describe_settings(config) -> tuple[dict, dict]:
                 "special": spec.get("_special", ""),
                 "bounds": spec.get("slider", {}),
             }
+            if kind == "dict":
+                # [patcher:group-cooldown] 面板控件只认字符串，自由映射统一
+                # 序列化成 JSON 文本展示；保存时再解析回 dict。
+                field["value"] = _dump_mapping(value)
+                field["default"] = _dump_mapping(default)
             fields.append(field)
     return {"revision": revision, "fields": fields}, values
+
+
+def _dump_mapping(value) -> str:
+    """把自由映射序列化成面板可编辑的 JSON 文本。"""
+    if not isinstance(value, dict):
+        return "{}"
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _parse_mapping(value):
+    """把面板回传的 JSON 文本解析成 ``{键: 数值}``。
+
+    Returns:
+        解析成功返回 dict；格式非法返回 None（由调用方转成用户可读的报错）。
+    """
+    if isinstance(value, dict):
+        data = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return {}
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+
+    parsed = {}
+    for key, raw in data.items():
+        name = str(key).strip()
+        if not name:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        if not math.isfinite(float(raw)):
+            return None
+        parsed[name] = int(raw) if float(raw).is_integer() else float(raw)
+    return parsed
 
 
 def validate_settings_changes(
@@ -137,9 +183,19 @@ def validate_settings_changes(
                 and isinstance(value, list)
                 and all(isinstance(item, str) for item in value)
             )
+            # [patcher:group-cooldown] 自由映射：面板回传 JSON 文本，
+            # 手改配置时可能是真正的 dict。
+            or (kind == "dict" and isinstance(value, (str, dict)))
         )
         if not valid:
             raise ValueError(f"「{label}」的格式不正确。")
+        if kind == "dict":
+            parsed = _parse_mapping(value)
+            if parsed is None:
+                raise ValueError(
+                    f"「{label}」需要是 JSON 对象，例如 {{\"<GROUP_ID>\": 300}}。"
+                )
+            value = parsed
         if field["options"] and value not in field["options"]:
             raise ValueError(f"请为「{label}」选择有效选项。")
         if kind in {"int", "float"}:

@@ -19,8 +19,10 @@ from typing import Any
 SCHEMA_VERSION = "2.0"
 PROMPT_VERSION = "meme-semantic-v8-category-reclassification"
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
-CAPTION_STATUSES = frozenset({"pending", "running", "done", "failed"})
+CAPTION_STATUSES = frozenset({"pending", "running", "done", "failed", "skipped_gif"})
 EMBEDDING_STATUSES = frozenset({"pending", "running", "done", "failed", "cleared"})
+#: GIF 按规则跳过视觉模型时写入的终态标记；与「请求失败」严格区分。
+CAPTION_SKIPPED_GIF = "skipped_gif"
 CATEGORY_FITS = frozenset({"match", "uncertain", "conflict"})
 CATEGORY_REVIEW_STATUSES = frozenset(
     {
@@ -152,6 +154,33 @@ def semantic_caption_is_complete(item: Any) -> bool:
         and str(item.get("caption") or "").strip()
         and normalize_tags(item.get("tags"))
     )
+
+
+def caption_skipped_gif(item: Any) -> bool:
+    """该记录是否因 GIF 按规则跳过了视觉识别。"""
+    return bool(
+        isinstance(item, dict)
+        and str(item.get("caption_status") or "").strip() == CAPTION_SKIPPED_GIF
+    )
+
+
+def semantic_caption_is_settled(item: Any) -> bool:
+    """描述阶段是否已无剩余工作：已完成，或按规则跳过（GIF）。
+
+    跳过不等于「描述成功」：这类记录没有 caption 与 tags，因此不会进入语义
+    索引，也不具备基于描述的搜索能力。
+    """
+    return semantic_caption_is_complete(item) or caption_skipped_gif(item)
+
+
+def semantic_item_has_pending_work(item: Any) -> bool:
+    """整条语义记录是否还有未完成的工作（描述或向量）。"""
+    if not semantic_caption_is_settled(item):
+        return True
+    if caption_skipped_gif(item):
+        # 跳过的 GIF 没有文本，不生成向量，也不算欠账。
+        return False
+    return str(item.get("embedding_status") or "") != "done"
 
 
 def semantic_entry_id(

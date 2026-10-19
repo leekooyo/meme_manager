@@ -285,24 +285,16 @@ async function initSettingsPage() {
 
       const packField = document.createElement("div");
       packField.className = "field-row";
-      const packLabel = document.createElement("label");
+      const packLabel = document.createElement("span");
+      packLabel.className = "pack-picker-label";
+      packLabel.id = `collect-source-packs-label-${index}`;
       packLabel.textContent = "镜像目标图库";
-      packLabel.htmlFor = `collect-source-packs-${index}`;
-      const packSelect = document.createElement("select");
-      packSelect.id = `collect-source-packs-${index}`;
-      packSelect.dataset.role = "packs";
-      packSelect.multiple = true;
-      packSelect.size = 4;
-      packSelect.title = "可多选：按住 Ctrl / ⌘ 点选，或直接点选多行";
-      appendPackOptions(packSelect, source.packs || []);
-      packSelect.addEventListener("change", () => {
+      const packPicker = createPackPicker(source, index, (picked) => {
         if (!collectSources[index]) return;
-        collectSources[index].packs = Array.from(packSelect.selectedOptions)
-          .map((option) => option.value)
-          .filter(Boolean);
+        collectSources[index].packs = picked;
         updateCollectSourcesState();
-      });
-      packField.append(packLabel, packSelect);
+      }, true);
+      packField.append(packLabel, packPicker);
 
       grid.append(keyField, gateField, packField);
       wrapper.appendChild(grid);
@@ -851,37 +843,205 @@ async function initSettingsPage() {
     return rules.findIndex((rule) => rule.scope === "default");
   }
 
+  // [patcher:pack-multi] 显式 pack_ids（含空数组）优先；只有字段缺失时才回退旧单值 pack_id。
+  // 若沿用「空数组也回退」的老写法，用户清空选择后旧 pack_id 会把选项复活。
   function normalizePackIds(rule) {
-    const ids = Array.isArray(rule?.pack_ids)
-      ? rule.pack_ids.map((item) => String(item || "").trim()).filter(Boolean)
-      : [];
-    if (ids.length) return ids;
+    const raw = rule?.pack_ids;
+    if (Array.isArray(raw)) {
+      const ids = [];
+      for (const item of raw) {
+        const packId = String(item || "").trim();
+        if (packId && !ids.includes(packId)) ids.push(packId);
+      }
+      return ids;
+    }
     const single = String(rule?.pack_id || "").trim();
     return single ? [single] : [];
   }
 
-  function appendPackOptions(select, selectedPackIds = []) {
-    const selected = (
-      Array.isArray(selectedPackIds) ? selectedPackIds : [selectedPackIds]
-    )
-      .map((item) => String(item || "").trim())
-      .filter(Boolean);
-    for (const packId of selected) {
-      if (installedPacks.some((pack) => String(pack.id) === packId)) continue;
-      const missingOption = document.createElement("option");
-      missingOption.value = packId;
-      missingOption.textContent = `表情包不存在（${packId}）`;
-      missingOption.selected = true;
-      select.appendChild(missingOption);
+  // [patcher:pack-multi] 发送规则和收集来源共用复选框列表。
+  // 两处各自以 rules[index].pack_ids / collectSources[index].packs 为数据源。
+  function createPackPicker(entry, index, onChange, isCollectSource = false) {
+    const selected = isCollectSource
+      ? (Array.isArray(entry?.packs) ? entry.packs : [])
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+      : normalizePackIds(entry);
+    const installedIds = new Set(
+      installedPacks.map((pack) => String(pack?.id || "").trim()).filter(Boolean),
+    );
+    const missingIds = selected.filter((packId) => !installedIds.has(packId));
+
+    const container = document.createElement("div");
+    container.className = "pack-picker";
+    container.id = isCollectSource
+      ? `collect-source-packs-${index}`
+      : `rule-pack-${index}`;
+    container.dataset.role = "pack-picker";
+    container.setAttribute("role", "group");
+    container.setAttribute(
+      "aria-labelledby",
+      isCollectSource
+        ? `collect-source-packs-label-${index}`
+        : `rule-pack-label-${index}`,
+    );
+
+    const bar = document.createElement("div");
+    bar.className = "pack-picker-bar";
+    const countLabel = document.createElement("span");
+    countLabel.className = "pack-picker-count";
+    countLabel.setAttribute("aria-live", "polite");
+    const tools = document.createElement("div");
+    tools.className = "pack-picker-tools";
+
+    const selectAllBtn = document.createElement("button");
+    selectAllBtn.type = "button";
+    selectAllBtn.className = "ghost compact-btn";
+    selectAllBtn.dataset.action = "pack-select-all";
+    selectAllBtn.textContent = "全选";
+    selectAllBtn.setAttribute("aria-label", isCollectSource
+      ? `全选第 ${index + 1} 个收集来源的镜像目标图库`
+      : `全选第 ${index + 1} 条规则的表情包`);
+    const clearBtn = document.createElement("button");
+    clearBtn.type = "button";
+    clearBtn.className = "ghost compact-btn";
+    clearBtn.dataset.action = "pack-clear";
+    clearBtn.textContent = "清空";
+    clearBtn.setAttribute("aria-label", isCollectSource
+      ? `清空第 ${index + 1} 个收集来源已选镜像目标图库`
+      : `清空第 ${index + 1} 条规则已选表情包`);
+    tools.append(selectAllBtn, clearBtn);
+    bar.append(countLabel, tools);
+
+    const list = document.createElement("div");
+    list.className = "pack-picker-list";
+    list.dataset.role = "pack-picker-list";
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", "表情包列表，可多选");
+
+    const alertBox = document.createElement("p");
+    alertBox.className = "pack-picker-alert";
+    alertBox.setAttribute("role", "status");
+    alertBox.hidden = true;
+
+    const hint = document.createElement("p");
+    hint.className = "pack-picker-hint";
+    hint.textContent =
+      "直接点击整行即可多选，无需按住 Ctrl；Tab 聚焦后用空格键也能切换。" +
+      (isCollectSource ? " 清空后将按默认图库收集。" : "");
+
+    function makeRow(packId, name, isMissing) {
+      const row = document.createElement("label");
+      row.className = `pack-option${isMissing ? " missing" : ""}`;
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.className = "pack-option-check";
+      input.value = packId;
+      input.checked = selected.includes(packId);
+      // 原生复选框已支持空格键；Enter 在复选框上默认无效，这里补一下更符合直觉。
+      input.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        input.click();
+      });
+      input.addEventListener("change", () => syncSelection());
+      const text = document.createElement("span");
+      text.className = "pack-option-text";
+      const nameEl = document.createElement("span");
+      nameEl.className = "pack-option-name";
+      nameEl.textContent = name;
+      const idEl = document.createElement("span");
+      idEl.className = "pack-option-id";
+      idEl.textContent = packId;
+      text.append(nameEl, idEl);
+      row.append(input, text);
+      if (isMissing) {
+        const tag = document.createElement("span");
+        tag.className = "pack-option-tag";
+        tag.textContent = "已失效";
+        row.appendChild(tag);
+      }
+      return row;
+    }
+
+    for (const packId of missingIds) {
+      list.appendChild(makeRow(packId, "表情包不存在", true));
     }
     for (const pack of installedPacks) {
-      const packId = String(pack.id || "");
-      const option = document.createElement("option");
-      option.value = packId;
-      option.selected = selected.includes(packId);
-      option.textContent = `${pack.name || packId} (${packId})`;
-      select.appendChild(option);
+      const packId = String(pack?.id || "");
+      list.appendChild(makeRow(packId, String(pack?.name || packId), false));
     }
+    if (!list.querySelector('input[type="checkbox"]')) {
+      const empty = document.createElement("p");
+      empty.className = "pack-picker-hint";
+      empty.textContent = "尚未安装任何表情包。";
+      list.appendChild(empty);
+    }
+
+    function checks() {
+      return Array.from(list.querySelectorAll('input[type="checkbox"]'));
+    }
+
+    function pickedIds() {
+      return checks()
+        .filter((input) => input.checked)
+        .map((input) => input.value);
+    }
+
+    function refreshChrome() {
+      const picked = pickedIds();
+      const checkedMissing = picked.filter((packId) => !installedIds.has(packId));
+      const installedChecks = checks().filter((input) =>
+        installedIds.has(input.value),
+      );
+
+      countLabel.textContent = `已选 ${picked.length} 个`;
+      countLabel.classList.toggle("empty", !isCollectSource && picked.length === 0);
+      container.classList.toggle("is-empty", !isCollectSource && picked.length === 0);
+      selectAllBtn.disabled =
+        !installedChecks.length ||
+        installedChecks.every((input) => input.checked);
+      clearBtn.disabled = picked.length === 0;
+
+      for (const input of checks()) {
+        input.closest(".pack-option")?.classList.toggle("checked", input.checked);
+      }
+
+      if (!picked.length && !isCollectSource) {
+        alertBox.textContent = "至少选择一个图包";
+        alertBox.hidden = false;
+      } else if (checkedMissing.length) {
+        alertBox.textContent = `引用的图包已不存在：${checkedMissing.join(
+          "、",
+        )}。请取消勾选或改选其他图包后再保存。`;
+        alertBox.hidden = false;
+      } else {
+        alertBox.textContent = "";
+        alertBox.hidden = true;
+      }
+    }
+
+    function syncSelection() {
+      const picked = pickedIds();
+      refreshChrome();
+      onChange(picked);
+    }
+
+    selectAllBtn.addEventListener("click", () => {
+      for (const input of checks()) {
+        if (installedIds.has(input.value)) input.checked = true;
+      }
+      syncSelection();
+    });
+
+    clearBtn.addEventListener("click", () => {
+      for (const input of checks()) input.checked = false;
+      syncSelection();
+    });
+
+    container.append(bar, list, alertBox, hint);
+    refreshChrome();
+    return container;
   }
 
   function getTargetSuggestions(scope) {
@@ -911,6 +1071,7 @@ async function initSettingsPage() {
     }
     rules[index][key] = value;
     if (key === "pack_ids") {
+      // [patcher:pack-multi] 清空时 pack_id 一起清空，避免 normalizePackIds 回退到旧值。
       const picked = Array.isArray(value) ? value : [];
       rules[index].pack_ids = picked;
       rules[index].pack_id = picked[0] || "";
@@ -971,7 +1132,8 @@ async function initSettingsPage() {
       const position = `第 ${index + 1} 条`;
       const id = String(rule.id || "").trim();
       const scope = String(rule.scope || "").trim();
-      const packId = String(rule.pack_id || "").trim();
+      // [patcher:pack-multi] 校验全部已选图包，而不是只看首项 pack_id。
+      const packIds = normalizePackIds(rule);
       const target = String(rule.target || "").trim();
 
       if (!id) {
@@ -985,10 +1147,19 @@ async function initSettingsPage() {
       if (!["persona", "session", "default"].includes(scope)) {
         errors.push(`${position} 的匹配类型无效: ${scope || "(空)"}`);
       }
-      if (!packId) {
-        errors.push(`${position} 尚未选择表情包`);
-      } else if (!installedPacks.some((pack) => String(pack.id) === packId)) {
-        errors.push(`${position} 的表情包已不存在，请重新选择`);
+      if (!packIds.length) {
+        errors.push(`${position} 至少选择一个图包`);
+      } else {
+        const missingIds = packIds.filter(
+          (packId) => !installedPacks.some((pack) => String(pack.id) === packId),
+        );
+        if (missingIds.length) {
+          errors.push(
+            `${position} 的表情包已不存在: ${missingIds.join(
+              "、",
+            )}，请取消勾选或改选其他表情包`,
+          );
+        }
       }
 
       if (scope === "default") {
@@ -1146,17 +1317,15 @@ async function initSettingsPage() {
 
       const packField = document.createElement("div");
       packField.className = "field-row";
-      const packLabel = document.createElement("label");
+      // [patcher:pack-multi] 原来的 <select multiple> 需要 Ctrl 才能多选，换成复选框列表。
+      const packLabel = document.createElement("span");
+      packLabel.className = "pack-picker-label";
+      packLabel.id = `rule-pack-label-${index}`;
       packLabel.textContent = "使用表情包";
-      packLabel.htmlFor = `rule-pack-${index}`;
-      const packSelectElement = document.createElement("select");
-      packSelectElement.dataset.role = "pack";
-      packSelectElement.id = `rule-pack-${index}`;
-      packSelectElement.multiple = true;
-      packSelectElement.size = 4;
-      packSelectElement.title = "可多选：按住 Ctrl / ⌘ 点选，或直接点选多行";
-      appendPackOptions(packSelectElement, normalizePackIds(rule));
-      packField.append(packLabel, packSelectElement);
+      const packPicker = createPackPicker(rule, index, (picked) => {
+        updateRuleFromInput(index, "pack_ids", picked);
+      });
+      packField.append(packLabel, packPicker);
 
       grid.appendChild(scopeField);
       grid.appendChild(targetField);
@@ -1190,7 +1359,6 @@ async function initSettingsPage() {
       const targetInput = targetField.querySelector(
         'input[data-role="target"]',
       );
-      const packSelect = packField.querySelector('select[data-role="pack"]');
 
       scopeSelect.disabled = isDefault;
       scopeSelect.addEventListener("change", () => {
@@ -1212,13 +1380,6 @@ async function initSettingsPage() {
 
       targetInput.addEventListener("input", () => {
         updateRuleFromInput(index, "target", targetInput.value);
-      });
-
-      packSelect.addEventListener("change", () => {
-        const picked = Array.from(packSelect.selectedOptions)
-          .map((option) => option.value)
-          .filter(Boolean);
-        updateRuleFromInput(index, "pack_ids", picked);
       });
 
       actions
@@ -1327,7 +1488,8 @@ async function initSettingsPage() {
     const defaultRule = rules.find(
       (rule) => String(rule.scope || "").trim() === "default",
     );
-    return String(defaultRule?.pack_id || "").trim();
+    // [patcher:pack-multi] 默认规则可能多选，取 pack_ids 首项作为新建规则的预选。
+    return String(normalizePackIds(defaultRule)[0] || "").trim();
   }
 
   function buildNewRule(scope) {
@@ -1352,11 +1514,12 @@ async function initSettingsPage() {
     }
     const payloadRules = rules.map((rule) => {
       // 保留多包绑定：pack_id 只存首个（兼容旧读法），完整集合在 pack_ids。
+      // 首项为空说明用户已清空选择，此时不能回填旧的 pack_id，否则会「复活」旧图包。
       const packIds = normalizePackIds(rule);
       const normalized = {
         id: String(rule.id || "").trim(),
         scope: String(rule.scope || "").trim(),
-        pack_id: packIds[0] || String(rule.pack_id || "").trim(),
+        pack_id: packIds[0] || "",
         pack_ids: packIds,
       };
       if (normalized.scope !== "default") {

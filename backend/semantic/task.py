@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .caption import generate_caption
+from .caption import generate_caption, is_gif_source
 from .index import (
     EmbeddingAdapter,
     build_index,
@@ -21,11 +21,14 @@ from .index import (
     load_index_manifest,
 )
 from .models import (
+    CAPTION_SKIPPED_GIF,
     REVIEW_CATEGORY,
     SemanticImage,
     ensure_category_tag,
     is_category_tag,
     semantic_caption_is_complete,
+    semantic_caption_is_settled,
+    semantic_item_has_pending_work,
     text_hash,
     utc_now,
 )
@@ -967,11 +970,13 @@ class SemanticTaskManager:
         waiting = sum(
             1
             for item in images.values()
+            if isinstance(item, dict) and semantic_item_has_pending_work(item)
+        )
+        skipped_gif = sum(
+            1
+            for item in images.values()
             if isinstance(item, dict)
-            and (
-                not semantic_caption_is_complete(item)
-                or item.get("embedding_status") == "pending"
-            )
+            and item.get("caption_status") == CAPTION_SKIPPED_GIF
         )
         embedding = self._embedding_adapter(pack_id)
         selection = self._load_selection(pack_id)
@@ -1032,7 +1037,7 @@ class SemanticTaskManager:
             for item in images.values()
             if isinstance(item, dict)
             and (
-                not semantic_caption_is_complete(item)
+                not semantic_caption_is_settled(item)
                 or (not worker_alive and item.get("caption_status") == "running")
             )
         )
@@ -1208,6 +1213,7 @@ class SemanticTaskManager:
             "reused_duplicate_files": int(data.get("reused_duplicate_files", 0)),
             "caption_done": caption_done,
             "caption_failed": caption_failed,
+            "caption_skipped_gif": skipped_gif,
             "embedding_done": embedding_done,
             "embedding_failed": embedding_failed,
             "pending": pending,
@@ -1377,7 +1383,7 @@ class SemanticTaskManager:
                     item.get("manual_override")
                     or item.get("provenance") in {"manual", "mixed"}
                 )
-                and (force or not semantic_caption_is_complete(item))
+                and (force or not semantic_caption_is_settled(item))
                 for item in metadata.get("images", {}).values()
             )
             if needs_caption and not self._vision_provider_ready():
@@ -1852,6 +1858,20 @@ class SemanticTaskManager:
             save_metadata(pack_dir, metadata)
             return
 
+        # GIF 一律跳过视觉模型：不构造请求、不重试、不切换模型，也不生成依赖
+        # 描述的标签与向量。标记为终态 skipped_gif，与「请求失败」区分；force
+        # 重跑同样遵守，避免空描述导致 GIF 被反复送入模型。
+        if item.caption_status == CAPTION_SKIPPED_GIF and not force:
+            return
+        if is_gif_source(path):
+            item.caption_status = CAPTION_SKIPPED_GIF
+            item.embedding_status = "cleared"
+            item.error = None
+            item.updated_at = utc_now()
+            raw_item.update(item.to_dict())
+            save_metadata(pack_dir, metadata)
+            return
+
         active_items: list[str] = []
         try:
             async with semaphore:
@@ -2055,13 +2075,13 @@ class SemanticTaskManager:
             all_captions_done = bool(
                 metadata.get("images")
                 and all(
-                    isinstance(item, dict) and semantic_caption_is_complete(item)
+                    isinstance(item, dict) and semantic_caption_is_settled(item)
                     for item in metadata.get("images", {}).values()
                 )
             )
             if mode == "caption_only":
                 failed = any(
-                    isinstance(item, dict) and not semantic_caption_is_complete(item)
+                    isinstance(item, dict) and not semantic_caption_is_settled(item)
                     for item in metadata.get("images", {}).values()
                 )
             elif embedding.ready and has_caption and all_captions_done:
@@ -2087,7 +2107,7 @@ class SemanticTaskManager:
                 )
             elif has_caption and not embedding.ready:
                 for item in metadata.get("images", {}).values():
-                    if not isinstance(item, dict) or not semantic_caption_is_complete(
+                    if not isinstance(item, dict) or not semantic_caption_is_settled(
                         item
                     ):
                         continue
@@ -2097,11 +2117,7 @@ class SemanticTaskManager:
             latest = await self._run_blocking(load_metadata, pack_dir)
             if mode != "caption_only":
                 failed = any(
-                    isinstance(item, dict)
-                    and (
-                        not semantic_caption_is_complete(item)
-                        or item.get("embedding_status") != "done"
-                    )
+                    isinstance(item, dict) and semantic_item_has_pending_work(item)
                     for item in latest.get("images", {}).values()
                 )
             final_state = await self._run_blocking(self._load_state, pack_id)

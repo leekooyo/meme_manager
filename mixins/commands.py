@@ -1014,6 +1014,12 @@ class CommandMixin:
         if not self._llm_free_probability_hit(settings["probability"]):
             return
 
+        # [patcher:group-cooldown] 群级配图冷却：这里必须提前返回，而不是
+        # 只靠发送闸兜底 —— 否则配额已耗尽仍会调视觉 API 挑分类、还会白转 GIF。
+        if not self._auto_image_allowed(event):
+            logger.debug("[meme_manager] 群级配图冷却中，跳过免模型发图")
+            return
+
         try:
             # Q25=甲：非模型路径合并「该会话绑定集合」的全部候选池。
             from ..backend.packs.resolver import get_pack_paths

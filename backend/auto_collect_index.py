@@ -47,11 +47,42 @@ class ImageMatch:
         exact_path: Existing image with identical SHA-256, if found.
         similar_path: Static image with a nearby dHash, for human review only.
         distance: Number of differing dHash bits for the visual hint.
+        root: Resolved image root that owned the matched row when the hit was
+            produced. Callers must use it (instead of their own assumption)
+            to explain the hit's location.
+        relative_path: POSIX-style path of the hit relative to ``root``.
     """
 
     exact_path: Path | None = None
     similar_path: Path | None = None
     distance: int | None = None
+    root: Path | None = None
+    relative_path: str = ""
+
+    def source_label(self) -> str:
+        """Return a stable ``<pack_id>/<relative path>`` label for the hit.
+
+        The label describes where the matched image actually lives, which is
+        not necessarily the pack currently being collected into. Returns an
+        empty string when no hit exists.
+        """
+        if not self.relative_path:
+            return ""
+        pack_id = self.root.parent.name if self.root is not None else ""
+        return f"{pack_id}/{self.relative_path}" if pack_id else self.relative_path
+
+
+def _relative_label(path: Path, root: Path) -> str:
+    """Return ``path`` relative to its owning root as a POSIX string.
+
+    The computation happens where the authoritative root is known, so callers
+    never have to guess which pack a hit belongs to. An empty string means the
+    row could not be explained by this root and must not be reported.
+    """
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return ""
 
 
 def _index_dir(pack_root: Path) -> Path:
@@ -258,6 +289,46 @@ class AutoCollectImageIndex:
             except (OSError, RuntimeError):
                 continue
             pending.extend(self._sync_directory(connection, root, resolved))
+        self._prune_outside_dirs(connection, visited)
+
+    @staticmethod
+    def _prune_outside_dirs(
+        connection: sqlite3.Connection, visited: set[str]
+    ) -> None:
+        """删除不属于本次遍历范围的目录行。
+
+        `_sync_directory` 只能清理「本次访问到的目录里消失的文件」，因此
+        **包目录被改名**（旧绝对路径整体消失）后，旧行永远不会进入 ``known``，
+        也就永远不会被删掉，会永久残留在库里污染精确/近似查询。
+        这里以本次遍历到的目录集为白名单整体裁剪一次。
+
+        Args:
+            connection: 该包的索引连接。
+            visited: 本次遍历成功访问到的目录绝对路径集合。
+        """
+        if not visited:
+            return
+        try:
+            present = connection.execute("SELECT DISTINCT d FROM files").fetchall()
+        except sqlite3.Error:
+            return
+        orphan_dirs: list[tuple[str]] = []
+        has_null = False
+        for (dir_text,) in present:
+            if dir_text is None:
+                has_null = True
+            elif dir_text not in visited:
+                orphan_dirs.append((dir_text,))
+        if not (has_null or orphan_dirs):
+            return
+        try:
+            if has_null:
+                connection.execute("DELETE FROM files WHERE d IS NULL")
+            if orphan_dirs:
+                connection.executemany("DELETE FROM files WHERE d=?", orphan_dirs)
+            connection.commit()
+        except sqlite3.Error:
+            return
 
     def _fill_visual_hashes(self, connection: sqlite3.Connection) -> None:
         """Compute dHash for rows that still carry no visual fingerprint."""
@@ -300,11 +371,20 @@ class AutoCollectImageIndex:
         with self._lock:
             connection = self._connect(root)
             self._refresh(connection, root)
+            # 只认当前 root 下的行：包目录改名后旧绝对路径可能残留，
+            # 一旦被选中，调用方拿到的路径并不存在（甚至 relative_to 直接抛错）。
+            prefix = str(root) + os.sep
             row = connection.execute(
-                "SELECT p FROM files WHERE h=? LIMIT 1", (digest,)
+                "SELECT p FROM files WHERE h=? AND substr(p,1,?)=? LIMIT 1",
+                (digest, len(prefix), prefix),
             ).fetchone()
             if row is not None:
-                return ImageMatch(exact_path=Path(row[0]))
+                exact_path = Path(row[0])
+                return ImageMatch(
+                    exact_path=exact_path,
+                    root=root,
+                    relative_path=_relative_label(exact_path, root),
+                )
             if candidate_path is None:
                 return ImageMatch()
 
@@ -318,6 +398,9 @@ class AutoCollectImageIndex:
                 "SELECT p, v FROM files WHERE v IS NOT NULL AND v <> ?",
                 (_DHASH_UNSET,),
             ):
+                if not path_text.startswith(prefix):
+                    # 越界行只可能来自包目录改名，忽略即可（无需在此处删除）。
+                    continue
                 value = _to_unsigned(stored)
                 if value is None:
                     continue
@@ -325,5 +408,11 @@ class AutoCollectImageIndex:
                 if distance <= 5 and (
                     closest.distance is None or distance < closest.distance
                 ):
-                    closest = ImageMatch(similar_path=Path(path_text), distance=distance)
+                    similar_path = Path(path_text)
+                    closest = ImageMatch(
+                        similar_path=similar_path,
+                        distance=distance,
+                        root=root,
+                        relative_path=_relative_label(similar_path, root),
+                    )
             return closest

@@ -72,6 +72,12 @@ PARAMS: list[dict] = [
        group="智能配图"),
     _p("单条图片上限", "generation.emotion.max_memes_per_message", "int", -1,
        "一条回复最多几张图，-1=不限", group="智能配图"),
+    # [patcher:group-cooldown] 群级配图冷却（per_group 映射表只走面板/配置文件）
+    _p("群图冷却开关", "generation.rate_limit.enabled", "bool", False,
+       "同群一定时间内最多自动发一张图", group="智能配图"),
+    _p("群图冷却", "generation.rate_limit.interval_seconds", "int", 300,
+       "同群两次自动配图的最小间隔，0=不限", minimum=0, maximum=86400,
+       unit="秒", group="智能配图"),
     # ---- 自动收集（auto_collect）----
     _p("收图开关", "auto_collect.enabled", "bool", False,
        "群里图片自动识别入库", group="自动收集"),

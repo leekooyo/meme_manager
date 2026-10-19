@@ -304,20 +304,24 @@ def rename_pack(
                 shutil.move(str(sem_src), str(sem_dst))
                 moved_dirs.append((sem_src, sem_dst))
 
+            # 派生索引库是纯缓存，且**库内以绝对路径为键**（auto_collect_index 的
+            # files.p/d、content_hash_index 的 digests.p）。改名时若「搬」库文件，
+            # 行里的旧路径不会跟着改，`_refresh` 也只按已访问目录清 stale，
+            # 于是旧路径变成永不清理的幽灵行：近似查重可能选中它 →
+            # auto_collect 的 relative_to 抛 ValueError → 整张图收集失败。
+            # 因此这里只删不搬，交给新 ID 首次使用时自行重建。
             for index_dir_name in _DERIVED_INDEX_DIRS:
                 index_dir = PLUGIN_DATA_DIR / index_dir_name
                 for suffix in (".sqlite3", ".sqlite3-wal", ".sqlite3-shm"):
-                    src = index_dir / f"{old}{suffix}"
-                    if not src.is_file():
+                    stale_index = index_dir / f"{old}{suffix}"
+                    if not stale_index.is_file():
                         continue
-                    dst = index_dir / f"{new_id}{suffix}"
                     try:
-                        shutil.move(str(src), str(dst))
-                        moved_dirs.append((src, dst))
+                        stale_index.unlink()
                     except OSError:
                         warnings.append(
-                            f"{index_dir_name}/{old}{suffix} 被占用，未改名"
-                            f"（纯缓存，新 ID 会自行重建）"
+                            f"{index_dir_name}/{old}{suffix} 被占用，未删除"
+                            f"（纯缓存，新 ID 首次使用时会自行重建）"
                         )
 
         # ---------- 2) 包内清单 ----------
